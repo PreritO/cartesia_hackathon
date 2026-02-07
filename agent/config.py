@@ -12,10 +12,6 @@ load_dotenv()
 class Config:
     """Application configuration loaded from environment variables."""
 
-    # Stream
-    stream_api_key: str = os.getenv("STREAM_API_KEY", "")
-    stream_api_secret: str = os.getenv("STREAM_API_SECRET", "")
-
     # LLM (Claude direct)
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -34,6 +30,11 @@ class Config:
     detection_fps: int = 5
     detection_confidence: float = 0.5
     commentary_cooldown: float = 5.0
+
+    # Server settings
+    server_port: int = int(os.getenv("SERVER_PORT", "8000"))
+    videos_dir: str = os.getenv("VIDEOS_DIR", "./videos")
+    max_video_duration: int = int(os.getenv("MAX_VIDEO_DURATION", "700"))
 
 
 config = Config()

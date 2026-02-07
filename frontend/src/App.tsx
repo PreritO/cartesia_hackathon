@@ -1,50 +1,37 @@
 /**
  * App - Main entry point for the AI Sports Commentator frontend.
  *
- * P0 MVP: Joins a Stream Video call and displays video/audio from
- * the AI commentator agent. No profile setup or commentary overlay yet.
- *
- * Usage:
- *   Open http://localhost:5173/?callId=your-call-id
- *   If no callId param is provided, defaults to "sports-commentator-dev".
+ * Flow:
+ *   1. User pastes a YouTube URL and clicks "Start Commentary"
+ *   2. Backend downloads the video and returns session info
+ *   3. Video plays in an embedded player with commentary overlay + TTS audio
  */
 
-import { StreamVideo } from "@stream-io/video-react-sdk";
-import "@stream-io/video-react-sdk/dist/css/styles.css";
+import { useState } from "react";
+import { URLInput } from "./components/URLInput";
+import { VideoPlayer } from "./components/VideoPlayer";
 
-import { useStreamVideo } from "./hooks/useStreamVideo.ts";
-import { VideoRoom } from "./components/VideoRoom.tsx";
-
-const DEFAULT_CALL_ID = "sports-commentator-dev";
-
-function getCallId(): string {
-  const params = new URLSearchParams(window.location.search);
-  return params.get("callId") || DEFAULT_CALL_ID;
+interface SessionInfo {
+  sessionId: string;
+  title: string;
+  duration: number;
+  videoUrl: string;
 }
 
 function App() {
-  const { client, isReady } = useStreamVideo();
-  const callId = getCallId();
+  const [session, setSession] = useState<SessionInfo | null>(null);
 
-  if (!isReady || !client) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-gray-950 text-white">
-        <div className="text-center">
-          <div className="mb-4 text-2xl font-bold">
-            AI Sports Commentator
-          </div>
-          <div className="text-sm text-gray-400">
-            Initializing Stream Video...
-          </div>
-        </div>
-      </div>
-    );
+  if (!session) {
+    return <URLInput onSessionCreated={setSession} />;
   }
 
   return (
-    <StreamVideo client={client}>
-      <VideoRoom client={client} callId={callId} />
-    </StreamVideo>
+    <VideoPlayer
+      sessionId={session.sessionId}
+      title={session.title}
+      videoUrl={session.videoUrl}
+      onBack={() => setSession(null)}
+    />
   );
 }
 

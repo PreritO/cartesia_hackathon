@@ -1,0 +1,132 @@
+"""FastAPI server for the AI Sports Commentator.
+
+Endpoints:
+- POST /api/start   — Download a YouTube video and return session info
+- WS   /ws/{session_id} — Stream commentary (text + TTS audio) over WebSocket
+- GET  /api/health   — Health check
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from agent.config import config
+from agent.pipeline import CommentaryPipeline, get_or_load_model
+from agent.video_download import VideoInfo, download_video
+
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="AI Sports Commentator")
+
+# CORS for frontend dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory session store: session_id -> VideoInfo
+_sessions: dict[str, VideoInfo] = {}
+
+# Active pipelines for cleanup
+_active_pipelines: dict[str, CommentaryPipeline] = {}
+
+
+# ---- Models ----
+
+
+class StartRequest(BaseModel):
+    url: str
+
+
+class StartResponse(BaseModel):
+    session_id: str
+    title: str
+    duration: int
+    video_url: str
+
+
+# ---- Endpoints ----
+
+
+@app.on_event("startup")
+async def startup():
+    """Pre-load the RF-DETR model on server start so first request is fast."""
+    videos_dir = Path(config.videos_dir)
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    # Mount videos directory for static serving
+    app.mount("/videos", StaticFiles(directory=str(videos_dir)), name="videos")
+
+    logger.info("Starting RF-DETR model warmup...")
+    await get_or_load_model()
+    logger.info("RF-DETR model ready. Server is live.")
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/start", response_model=StartResponse)
+async def start_commentary(req: StartRequest):
+    """Download a YouTube video and return a session for WebSocket commentary."""
+    video = await download_video(
+        url=req.url,
+        output_dir=config.videos_dir,
+        max_duration=config.max_video_duration,
+    )
+
+    session_id = str(uuid.uuid4())[:8]
+    _sessions[session_id] = video
+
+    logger.info("Session %s created for: %s (%ds)", session_id, video.title, video.duration)
+
+    return StartResponse(
+        session_id=session_id,
+        title=video.title,
+        duration=video.duration,
+        video_url=f"/videos/{video.path.name}",
+    )
+
+
+@app.websocket("/ws/{session_id}")
+async def commentary_ws(ws: WebSocket, session_id: str):
+    """WebSocket endpoint that streams commentary for a session."""
+    video = _sessions.get(session_id)
+    if video is None:
+        await ws.close(code=4004, reason="Session not found")
+        return
+
+    await ws.accept()
+    logger.info("WebSocket connected for session %s", session_id)
+
+    pipeline = CommentaryPipeline(ws=ws, video_path=video.path)
+    _active_pipelines[session_id] = pipeline
+
+    try:
+        await pipeline.run()
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for session %s", session_id)
+    finally:
+        await pipeline.stop()
+        _active_pipelines.pop(session_id, None)
+        logger.info("Pipeline stopped for session %s", session_id)
+
+
+# ---- Entry point ----
+
+if __name__ == "__main__":
+    import uvicorn
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+    uvicorn.run(app, host="0.0.0.0", port=config.server_port)

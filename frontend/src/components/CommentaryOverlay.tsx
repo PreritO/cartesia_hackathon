@@ -1,32 +1,57 @@
 /**
- * CommentaryOverlay - Displays current commentary text and active analyst.
+ * CommentaryOverlay - Lower-third style text captions for commentary.
  *
- * TODO: Implement after /plan p2-multi-analyst
- * - Show the current analyst name and avatar
- * - Display commentary text with fade-in/fade-out
- * - Show emotion indicator (excited, tense, etc.)
+ * Displays the most recent commentary line with a fade-in animation,
+ * styled like a sports broadcast lower third.
  */
 
-interface CommentaryOverlayProps {
-  analyst: string;
+interface CommentaryItem {
+  id: number;
   text: string;
   emotion: string;
-  visible: boolean;
+  timestamp: number;
 }
 
-export function CommentaryOverlay({
-  analyst,
-  text,
-  emotion,
-  visible,
-}: CommentaryOverlayProps) {
-  if (!visible) return null;
+interface CommentaryOverlayProps {
+  items: CommentaryItem[];
+}
+
+const EMOTION_COLORS: Record<string, string> = {
+  excited: "border-l-yellow-400",
+  tense: "border-l-orange-500",
+  thoughtful: "border-l-blue-400",
+  celebratory: "border-l-green-400",
+  disappointed: "border-l-red-400",
+  urgent: "border-l-red-500",
+  neutral: "border-l-gray-400",
+};
+
+export function CommentaryOverlay({ items }: CommentaryOverlayProps) {
+  if (items.length === 0) return null;
+
+  const latest = items[items.length - 1];
+  const borderColor = EMOTION_COLORS[latest.emotion] || EMOTION_COLORS.neutral;
 
   return (
-    <div className="commentary-overlay">
-      <div className="analyst-badge">{analyst}</div>
-      <div className="emotion-indicator">{emotion}</div>
-      <p className="commentary-text">{text}</p>
+    <div className="pointer-events-none absolute bottom-16 left-4 right-4">
+      <div
+        key={latest.id}
+        className={`animate-fade-in rounded border-l-4 ${borderColor} bg-black/75 px-4 py-3 backdrop-blur-sm`}
+      >
+        <p className="text-base font-medium leading-relaxed text-white drop-shadow-lg">
+          {latest.text}
+        </p>
+      </div>
+
+      <style>{`
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(8px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.3s ease-out;
+        }
+      `}</style>
     </div>
   );
 }

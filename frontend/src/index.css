@@ -21,20 +21,3 @@ body,
   color: #f9fafb; /* gray-50 */
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-
-/*
- * Override Stream Video SDK styles for a cleaner look.
- * The SDK ships its own CSS which we import in App.tsx.
- * These overrides ensure the video fills the viewport.
- */
-.str-video {
-  --str-video__background-color: #030712;
-}
-
-.str-video__speaker-layout {
-  height: 100vh !important;
-}
-
-.str-video__speaker-layout__wrapper {
-  background-color: #030712 !important;
-}
