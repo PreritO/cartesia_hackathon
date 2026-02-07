@@ -22,9 +22,8 @@ class Config:
     # Cartesia (TTS + STT)
     cartesia_api_key: str = os.getenv("CARTESIA_API_KEY", "")
 
-    # Roboflow
-    roboflow_api_key: str = os.getenv("ROBOFLOW_API_KEY", "")
-    roboflow_model_id: str = os.getenv("ROBOFLOW_MODEL_ID", "football-detection")
+    # RF-DETR (local model, no API key needed)
+    rfdetr_model_id: str = os.getenv("RFDETR_MODEL_ID", "rfdetr-base")
 
     # Voice IDs
     voice_id_danny: str = os.getenv("VOICE_ID_DANNY", "")
@@ -34,7 +33,7 @@ class Config:
     # Detection settings
     detection_fps: int = 5
     detection_confidence: float = 0.5
-    commentary_cooldown: float = 3.0
+    commentary_cooldown: float = 5.0
 
 
 config = Config()

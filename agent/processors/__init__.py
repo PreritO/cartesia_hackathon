@@ -1,5 +1,6 @@
 """Sports event detection processors."""
 
-from agent.processors.sports_processor import SportsCommentaryProcessor
+from agent.processors.detection_processor import LocalDetectionProcessor
+from agent.processors.events import DetectedObject, DetectionCompletedEvent
 
-__all__ = ["SportsCommentaryProcessor"]
+__all__ = ["LocalDetectionProcessor", "DetectedObject", "DetectionCompletedEvent"]
