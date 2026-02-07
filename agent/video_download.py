@@ -107,7 +107,8 @@ async def _extract_info(url: str) -> dict:
 def _download(url: str, output_path: str) -> None:
     """Download the video to a specific path (blocking)."""
     opts = {
-        "format": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Prefer single pre-merged MP4 first (no ffmpeg needed), fall back to merge
+        "format": "best[height<=720][ext=mp4]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": output_path,
         "merge_output_format": "mp4",
         "quiet": False,
