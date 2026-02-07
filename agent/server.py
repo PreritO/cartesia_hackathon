@@ -98,38 +98,9 @@ async def start_commentary(req: StartRequest):
     )
 
 
-@app.websocket("/ws/{session_id}")
-async def commentary_ws(ws: WebSocket, session_id: str):
-    """WebSocket endpoint that streams commentary for a session."""
-    video = _sessions.get(session_id)
-    if video is None:
-        await ws.close(code=4004, reason="Session not found")
-        return
-
-    # If there's already an active pipeline for this session (e.g. React StrictMode
-    # double-mount), stop it before starting a new one.
-    existing = _active_pipelines.pop(session_id, None)
-    if existing is not None:
-        logger.info("Replacing existing pipeline for session %s", session_id)
-        await existing.stop()
-
-    await ws.accept()
-    logger.info("WebSocket connected for session %s", session_id)
-
-    pipeline = CommentaryPipeline(ws=ws, video_path=video.path)
-    _active_pipelines[session_id] = pipeline
-
-    try:
-        await pipeline.run()
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected for session %s", session_id)
-    finally:
-        await pipeline.stop()
-        _active_pipelines.pop(session_id, None)
-        logger.info("Pipeline stopped for session %s", session_id)
-
-
 # ---- Live streaming endpoint (Chrome Extension) ----
+# NOTE: /ws/live must be registered BEFORE /ws/{session_id} so the literal
+# path matches before the path-parameter route captures "live" as a session_id.
 
 # Active live pipelines for cleanup
 _active_live_pipelines: dict[str, LiveCommentaryPipeline] = {}
@@ -175,6 +146,40 @@ async def live_commentary_ws(ws: WebSocket):
         await pipeline.stop()
         _active_live_pipelines.pop(session_id, None)
         logger.info("Live pipeline stopped: session %s", session_id)
+
+
+# ---- File-based streaming endpoint (YouTube download mode) ----
+
+
+@app.websocket("/ws/{session_id}")
+async def commentary_ws(ws: WebSocket, session_id: str):
+    """WebSocket endpoint that streams commentary for a session."""
+    video = _sessions.get(session_id)
+    if video is None:
+        await ws.close(code=4004, reason="Session not found")
+        return
+
+    # If there's already an active pipeline for this session (e.g. React StrictMode
+    # double-mount), stop it before starting a new one.
+    existing = _active_pipelines.pop(session_id, None)
+    if existing is not None:
+        logger.info("Replacing existing pipeline for session %s", session_id)
+        await existing.stop()
+
+    await ws.accept()
+    logger.info("WebSocket connected for session %s", session_id)
+
+    pipeline = CommentaryPipeline(ws=ws, video_path=video.path)
+    _active_pipelines[session_id] = pipeline
+
+    try:
+        await pipeline.run()
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for session %s", session_id)
+    finally:
+        await pipeline.stop()
+        _active_pipelines.pop(session_id, None)
+        logger.info("Pipeline stopped for session %s", session_id)
 
 
 # ---- Entry point ----
