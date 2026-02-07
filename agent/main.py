@@ -101,7 +101,7 @@ def create_agent() -> Agent:
     NO_BALL_THRESHOLD = 3  # frames without ball before triggering
 
     @agent.events.subscribe
-    async def on_detection(event: DetectionCompletedEvent) -> None:
+    async def on_detection(event: DetectionCompletedEvent):
         nonlocal ball_was_present, consecutive_no_ball
 
         ball_detected = any(obj["label"] == "sports ball" for obj in event.objects)

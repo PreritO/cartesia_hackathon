@@ -128,7 +128,7 @@ class LocalDetectionProcessor(VideoProcessorPublisher, Warmable[dict]):
     def attach_agent(self, agent: Agent) -> None:
         """Register our custom event type with the agent's EventManager."""
         self._agent = agent
-        agent.event_manager.register(DetectionCompletedEvent)
+        agent.events.register(DetectionCompletedEvent)
         logger.info("LocalDetectionProcessor attached to agent, event registered")
 
     # ---- VideoPublisher: output annotated frames ----
@@ -236,7 +236,7 @@ class LocalDetectionProcessor(VideoProcessorPublisher, Warmable[dict]):
                     image_width=w,
                     image_height=h,
                 )
-                self._agent.event_manager.send(event)
+                self._agent.events.send(event)
 
         except asyncio.CancelledError:
             raise
