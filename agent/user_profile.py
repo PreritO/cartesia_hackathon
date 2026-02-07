@@ -69,8 +69,6 @@ class UserProfile:
             connections.append(f"Players from {self.alma_mater}: {', '.join(names)}")
 
         if self.hometown_connections:
-            connections.append(
-                f"Hometown connections: {', '.join(self.hometown_connections[:2])}"
-            )
+            connections.append(f"Hometown connections: {', '.join(self.hometown_connections[:2])}")
 
         return "; ".join(connections) if connections else "No special connections"
