@@ -16,18 +16,15 @@ class Config:
     stream_api_key: str = os.getenv("STREAM_API_KEY", "")
     stream_api_secret: str = os.getenv("STREAM_API_SECRET", "")
 
-    # LLM
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    google_api_key: str = os.getenv("GOOGLE_API_KEY", "")
+    # LLM (Claude direct)
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
 
-    # Cartesia TTS
+    # Cartesia (TTS + STT)
     cartesia_api_key: str = os.getenv("CARTESIA_API_KEY", "")
-
-    # Deepgram STT
-    deepgram_api_key: str = os.getenv("DEEPGRAM_API_KEY", "")
 
     # Roboflow
     roboflow_api_key: str = os.getenv("ROBOFLOW_API_KEY", "")
+    roboflow_model_id: str = os.getenv("ROBOFLOW_MODEL_ID", "football-detection")
 
     # Voice IDs
     voice_id_danny: str = os.getenv("VOICE_ID_DANNY", "")
