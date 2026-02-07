@@ -321,7 +321,7 @@ class CommentaryPipeline:
                 "bit_rate": 128000,
             },
             language="en",
-            speed=speed,
+            generation_config={"speed": speed},
         )
         async for chunk in response:
             audio_chunks.append(chunk)

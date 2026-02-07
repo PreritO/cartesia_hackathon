@@ -107,6 +107,13 @@ async def commentary_ws(ws: WebSocket, session_id: str):
         await ws.close(code=4004, reason="Session not found")
         return
 
+    # If there's already an active pipeline for this session (e.g. React StrictMode
+    # double-mount), stop it before starting a new one.
+    existing = _active_pipelines.pop(session_id, None)
+    if existing is not None:
+        logger.info("Replacing existing pipeline for session %s", session_id)
+        await existing.stop()
+
     await ws.accept()
     logger.info("WebSocket connected for session %s", session_id)
 
