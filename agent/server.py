@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent.config import config
-from agent.pipeline import CommentaryPipeline, get_or_load_model
+from agent.pipeline import CommentaryPipeline, LiveCommentaryPipeline, get_or_load_model
 from agent.video_download import VideoInfo, download_video
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ app = FastAPI(title="AI Sports Commentator")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -128,6 +127,54 @@ async def commentary_ws(ws: WebSocket, session_id: str):
         await pipeline.stop()
         _active_pipelines.pop(session_id, None)
         logger.info("Pipeline stopped for session %s", session_id)
+
+
+# ---- Live streaming endpoint (Chrome Extension) ----
+
+# Active live pipelines for cleanup
+_active_live_pipelines: dict[str, LiveCommentaryPipeline] = {}
+
+
+@app.websocket("/ws/live")
+async def live_commentary_ws(ws: WebSocket):
+    """WebSocket for Chrome Extension: receives JPEG frames, streams commentary back."""
+    await ws.accept()
+    session_id = str(uuid.uuid4())[:8]
+    logger.info("Live WebSocket connected: session %s", session_id)
+
+    pipeline = LiveCommentaryPipeline(ws=ws)
+    _active_live_pipelines[session_id] = pipeline
+
+    try:
+        await pipeline.initialize()
+
+        while True:
+            message = await ws.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            # Binary message = JPEG frame
+            if "bytes" in message and message["bytes"]:
+                await pipeline.process_frame(message["bytes"])
+
+            # Text message = JSON command
+            elif "text" in message and message["text"]:
+                import json
+
+                data = json.loads(message["text"])
+                if data.get("type") == "stop":
+                    logger.info("Client requested stop for live session %s", session_id)
+                    break
+
+    except WebSocketDisconnect:
+        logger.info("Live WebSocket disconnected: session %s", session_id)
+    except Exception:
+        logger.exception("Error in live commentary session %s", session_id)
+    finally:
+        await pipeline.stop()
+        _active_live_pipelines.pop(session_id, None)
+        logger.info("Live pipeline stopped: session %s", session_id)
 
 
 # ---- Entry point ----

@@ -1,14 +1,17 @@
-"""Standalone commentary pipeline: video → detection → LLM → TTS → WebSocket.
+"""Commentary pipelines: video/live → detection → LLM → TTS → WebSocket.
 
-Bypasses Stream SFU entirely. Uses VideoFileTrack for frame reading, RF-DETR
-for detection, Claude for commentary, and Cartesia for TTS. Streams results
-to the browser over a WebSocket.
+Provides a ``BaseCommentaryPipeline`` with all shared detection, LLM, and TTS
+logic, plus two concrete subclasses:
+
+* ``CommentaryPipeline`` -- reads an MP4 file via VideoFileTrack.
+* ``LiveCommentaryPipeline`` -- accepts live JPEG frames pushed externally.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import random
 import re
@@ -23,6 +26,7 @@ import supervision as sv
 from anthropic import AsyncAnthropic
 from cartesia import AsyncCartesia
 from fastapi import WebSocket, WebSocketDisconnect
+from PIL import Image
 from vision_agents.core.utils.video_track import VideoFileTrack
 
 from agent.config import config
@@ -64,23 +68,22 @@ class Debouncer:
         return False
 
 
-class CommentaryPipeline:
-    """End-to-end pipeline: reads video → detects objects → generates commentary → TTS → WebSocket.
+class BaseCommentaryPipeline:
+    """Shared detection, LLM commentary, and TTS logic.
 
-    Runs entirely locally except for Claude API (LLM) and Cartesia API (TTS).
-    No Stream SFU connection needed.
+    Subclasses provide the frame source (file or live).  This base class owns
+    the RF-DETR model reference, API clients, ball-tracking state, debouncing,
+    and all commentary generation / TTS synthesis methods.
 
     Args:
         ws: WebSocket connection to stream results to the frontend.
-        video_path: Path to the downloaded MP4 file.
     """
 
-    def __init__(self, ws: WebSocket, video_path: Path) -> None:
+    def __init__(self, ws: WebSocket) -> None:
         self.ws = ws
-        self.video_path = video_path
         self._running = False
 
-        # RF-DETR model (loaded during warmup)
+        # RF-DETR model (loaded via _load_model)
         self._model: Any = None
         self._class_name_map: dict[int, str] = {}
 
@@ -100,72 +103,23 @@ class CommentaryPipeline:
         # Debouncer
         self._debouncer = Debouncer(config.commentary_cooldown)
 
-    async def run(self) -> None:
-        """Main loop: warm up model, read frames, detect, commentate."""
-        self._running = True
+    # ---- Model loading ----
 
-        try:
-            # Load RF-DETR model (uses global cache)
-            await self._send_status("Loading RF-DETR model...")
-            cached = await get_or_load_model()
-            self._model = cached["model"]
-            self._class_name_map = cached["class_name_map"]
-            await self._send_status("Model loaded. Starting commentary...")
-
-            # Open video file
-            track = await asyncio.to_thread(
-                VideoFileTrack, str(self.video_path), fps=config.detection_fps
-            )
-
-            while self._running:
-                try:
-                    frame = await track.recv()
-                except Exception:
-                    logger.info("Video track ended or errored")
-                    break
-
-                # Check if client disconnected
-                try:
-                    # Non-blocking check for incoming messages (e.g. pause/stop)
-                    msg = await asyncio.wait_for(self.ws.receive_json(), timeout=0.01)
-                    if msg.get("type") == "stop":
-                        logger.info("Client requested stop")
-                        break
-                except asyncio.TimeoutError:
-                    pass
-                except WebSocketDisconnect:
-                    logger.info("WebSocket disconnected")
-                    break
-
-                # Run detection on the frame
-                objects = await self._detect_frame(frame)
-
-                # Ball tracking + commentary
-                await self._handle_detections(objects)
-
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected during pipeline")
-        except asyncio.CancelledError:
-            logger.info("Pipeline cancelled")
-        except Exception:
-            logger.exception("Pipeline error")
-        finally:
-            self._running = False
-            await self._cartesia.close()
-            logger.info("Pipeline stopped")
-
-    async def stop(self) -> None:
-        """Signal the pipeline to stop."""
-        self._running = False
+    async def _load_model(self) -> None:
+        """Load (or retrieve from cache) the RF-DETR model."""
+        await self._send_status("Loading RF-DETR model...")
+        cached = await get_or_load_model()
+        self._model = cached["model"]
+        self._class_name_map = cached["class_name_map"]
+        await self._send_status("Model loaded. Starting commentary...")
 
     # ---- Detection ----
 
-    async def _detect_frame(self, frame: av.VideoFrame) -> list[DetectedObject]:
-        """Run RF-DETR on a single frame, return detected objects."""
+    async def _detect_from_array(self, img: np.ndarray) -> list[DetectedObject]:
+        """Run RF-DETR on an RGB24 numpy array, return detected objects."""
         if self._model is None:
             return []
 
-        img = frame.to_ndarray(format="rgb24")
         loop = asyncio.get_running_loop()
 
         detections: sv.Detections = await loop.run_in_executor(
@@ -336,6 +290,107 @@ class CommentaryPipeline:
             await self.ws.send_json({"type": "status", "message": message})
         except WebSocketDisconnect:
             self._running = False
+
+    async def stop(self) -> None:
+        """Signal the pipeline to stop."""
+        self._running = False
+
+
+class CommentaryPipeline(BaseCommentaryPipeline):
+    """File-based pipeline: reads an MP4 via VideoFileTrack and runs commentary.
+
+    Args:
+        ws: WebSocket connection to stream results to the frontend.
+        video_path: Path to the downloaded MP4 file.
+    """
+
+    def __init__(self, ws: WebSocket, video_path: Path) -> None:
+        super().__init__(ws)
+        self.video_path = video_path
+
+    async def run(self) -> None:
+        """Main loop: warm up model, read frames, detect, commentate."""
+        self._running = True
+
+        try:
+            await self._load_model()
+
+            # Open video file
+            track = await asyncio.to_thread(
+                VideoFileTrack, str(self.video_path), fps=config.detection_fps
+            )
+
+            while self._running:
+                try:
+                    frame = await track.recv()
+                except Exception:
+                    logger.info("Video track ended or errored")
+                    break
+
+                # Check if client disconnected
+                try:
+                    # Non-blocking check for incoming messages (e.g. pause/stop)
+                    msg = await asyncio.wait_for(self.ws.receive_json(), timeout=0.01)
+                    if msg.get("type") == "stop":
+                        logger.info("Client requested stop")
+                        break
+                except asyncio.TimeoutError:
+                    pass
+                except WebSocketDisconnect:
+                    logger.info("WebSocket disconnected")
+                    break
+
+                # Run detection on the frame
+                objects = await self._detect_from_array(frame.to_ndarray(format="rgb24"))
+
+                # Ball tracking + commentary
+                await self._handle_detections(objects)
+
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected during pipeline")
+        except asyncio.CancelledError:
+            logger.info("Pipeline cancelled")
+        except Exception:
+            logger.exception("Pipeline error")
+        finally:
+            self._running = False
+            await self._cartesia.close()
+            logger.info("Pipeline stopped")
+
+
+class LiveCommentaryPipeline(BaseCommentaryPipeline):
+    """Live pipeline: accepts externally-pushed JPEG frames.
+
+    Unlike ``CommentaryPipeline`` which reads from a file, this class exposes
+    an ``initialize`` / ``process_frame`` interface so a caller (e.g. a
+    WebSocket handler receiving webcam frames) can feed frames one at a time.
+
+    Args:
+        ws: WebSocket connection to stream results to the frontend.
+    """
+
+    def __init__(self, ws: WebSocket) -> None:
+        super().__init__(ws)
+
+    async def initialize(self) -> None:
+        """Load the RF-DETR model and notify the client."""
+        self._running = True
+        await self._load_model()
+
+    async def process_frame(self, jpeg_bytes: bytes) -> None:
+        """Decode a JPEG frame, run detection, and handle events.
+
+        Args:
+            jpeg_bytes: Raw JPEG image bytes (e.g. from a webcam capture).
+        """
+        if not self._running:
+            return
+
+        img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+        frame_array = np.array(img)
+
+        objects = await self._detect_from_array(frame_array)
+        await self._handle_detections(objects)
 
 
 # ---- Shared model cache ----

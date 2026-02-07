@@ -12,6 +12,10 @@ export default defineConfig({
         target: 'ws://localhost:8000',
         ws: true,
       },
+      '/ws/live': {
+        target: 'ws://localhost:8000',
+        ws: true,
+      },
       '/videos': 'http://localhost:8000',
     },
   },
