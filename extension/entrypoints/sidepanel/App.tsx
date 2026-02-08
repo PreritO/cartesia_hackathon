@@ -1,11 +1,10 @@
 /**
- * Side Panel — streams the active tab's video via getDisplayMedia(),
- * captures frames at 15 FPS (sends to backend at 5 FPS), displays a
- * DELAYED video feed synced with AI commentary + TTS audio.
+ * Side Panel — receives frames from the content script (via Chrome port),
+ * buffers them for delayed playback synced with AI commentary + TTS audio.
  *
  * Sync strategy: "Calibrate-then-play"
- * 1. Capture frames and send to backend immediately.
- * 2. Buffer frames but DON'T show video yet ("Calibrating...").
+ * 1. Content script captures frames from YouTube's <video> element.
+ * 2. Side panel receives frames, buffers them, and forwards to backend.
  * 3. When first commentary arrives, measure actual processing time.
  * 4. Lock video delay = processingTime + buffer. Never change it again.
  * 5. Start playing delayed video. Schedule all commentary with same delay.
@@ -13,29 +12,31 @@
  */
 
 import { useCallback, useRef, useState } from 'react';
-import { BACKEND_WS_URL, CAPTURE_FPS, JPEG_QUALITY, MAX_CANVAS_WIDTH } from '../../lib/constants';
+import { BACKEND_WS_URL } from '../../lib/constants';
 import { ProfileSetup, UserProfileData } from './ProfileSetup';
 
-/** Display buffer FPS for smooth delayed playback. */
-const DISPLAY_FPS = 15;
-/** Send to backend every Nth display frame to match CAPTURE_FPS. */
-const BACKEND_SEND_EVERY = Math.max(1, Math.round(DISPLAY_FPS / CAPTURE_FPS));
 /** Buffer added on top of measured processing time. */
 const DELAY_BUFFER_MS = 2500;
 /** Min delay even if processing is somehow instant. */
 const MIN_DELAY_MS = 3000;
 /** Number of commentaries to sample before locking delay. */
 const CALIBRATION_SAMPLES = 2;
-/** Max frames in buffer (~30s at 15 FPS). */
-const MAX_BUFFER_FRAMES = 450;
+/** Max frames in buffer (~60s at 5 FPS). */
+const MAX_BUFFER_FRAMES = 300;
+
+/** Convert a base64 string to a Blob for WebSocket binary send. */
+function base64ToBlob(b64: string, mime = 'image/jpeg'): Blob {
+  const binary = atob(b64);
+  const arr = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
 
 interface CommentaryEntry {
   text: string;
   emotion: string;
   analyst: string;
-  /** When the frame was captured (ms since epoch). */
   capturedAt: number;
-  /** When commentary was displayed to the user (ms since epoch). */
   displayedAt: number;
 }
 
@@ -46,14 +47,15 @@ interface DetectionInfo {
 }
 
 interface BufferedFrame {
-  blobUrl: string;
+  /** data:image/jpeg;base64,... URL for direct <img> src use. */
+  src: string;
   timestamp: number;
 }
 
 export function App() {
   const [view, setView] = useState<'setup' | 'stream'>('setup');
   const [userProfile, setUserProfile] = useState<UserProfileData | null>(null);
-  const [status, setStatus] = useState('Click "Start Stream" and pick your YouTube tab.');
+  const [status, setStatus] = useState('Click "Start Stream" to begin.');
   const [streaming, setStreaming] = useState(false);
   const [calibrated, setCalibrated] = useState(false);
   const [commentary, setCommentary] = useState<CommentaryEntry[]>([]);
@@ -62,27 +64,20 @@ export function App() {
   const [delayedFrameSrc, setDelayedFrameSrc] = useState<string | null>(null);
   const [lockedDelayDisplay, setLockedDelayDisplay] = useState(0);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const capturePortRef = useRef<chrome.runtime.Port | null>(null);
+  const captureTabIdRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioQueueRef = useRef<string[]>([]);
   const playingAudioRef = useRef(false);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const frameBufferRef = useRef<BufferedFrame[]>([]);
   const rafIdRef = useRef<number | null>(null);
-  const frameCaptureCountRef = useRef(0);
   const commentaryTimerIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-  /** When streaming started (for relative timestamps). */
   const streamStartRef = useRef(0);
 
   // ---- Calibration state ----
-  /** Whether we've locked the delay (set once, never changes). */
   const calibratedRef = useRef(false);
-  /** The locked video delay in ms. Set once after calibration, then frozen. */
   const lockedDelayRef = useRef(0);
-  /** Processing time samples collected during calibration. */
   const calibrationSamplesRef = useRef<number[]>([]);
 
   // ---- Calibration: collects samples, locks delay on the Nth commentary ----
@@ -98,11 +93,9 @@ export function App() {
     );
 
     if (sampleCount < CALIBRATION_SAMPLES) {
-      // Still collecting — show this commentary immediately (no sync yet)
       return false;
     }
 
-    // Use the max of all samples for the most conservative estimate
     const worstCase = Math.max(...calibrationSamplesRef.current);
     const delay = Math.max(MIN_DELAY_MS, worstCase + DELAY_BUFFER_MS);
 
@@ -116,7 +109,6 @@ export function App() {
       calibrationSamplesRef.current, worstCase, delay,
     );
 
-    // NOW start the delayed playback loop (video appears)
     startDelayedPlayback();
     return true;
   }
@@ -146,13 +138,12 @@ export function App() {
   // ---- Delayed playback (rAF loop, started AFTER calibration) ----
 
   const startDelayedPlayback = useCallback(() => {
-    let lastDisplayedUrl: string | null = null;
+    let lastDisplayedSrc: string | null = null;
 
     function tick() {
       const buffer = frameBufferRef.current;
       const targetTime = Date.now() - lockedDelayRef.current;
 
-      // Find the latest frame at or before targetTime
       let bestIdx = -1;
       for (let i = buffer.length - 1; i >= 0; i--) {
         if (buffer[i].timestamp <= targetTime) {
@@ -161,14 +152,11 @@ export function App() {
         }
       }
 
-      if (bestIdx >= 0 && buffer[bestIdx].blobUrl !== lastDisplayedUrl) {
-        lastDisplayedUrl = buffer[bestIdx].blobUrl;
-        setDelayedFrameSrc(lastDisplayedUrl);
+      if (bestIdx >= 0 && buffer[bestIdx].src !== lastDisplayedSrc) {
+        lastDisplayedSrc = buffer[bestIdx].src;
+        setDelayedFrameSrc(lastDisplayedSrc);
 
-        // Revoke frames we've passed
-        for (let i = 0; i < bestIdx; i++) {
-          URL.revokeObjectURL(buffer[i].blobUrl);
-        }
+        // Drop older frames (no URL.revokeObjectURL needed for data URLs)
         frameBufferRef.current = buffer.slice(bestIdx);
       }
 
@@ -182,9 +170,6 @@ export function App() {
     if (rafIdRef.current !== null) {
       cancelAnimationFrame(rafIdRef.current);
       rafIdRef.current = null;
-    }
-    for (const frame of frameBufferRef.current) {
-      URL.revokeObjectURL(frame.blobUrl);
     }
     frameBufferRef.current = [];
     for (const id of commentaryTimerIdsRef.current) {
@@ -202,38 +187,106 @@ export function App() {
   // ---- Stream lifecycle ----
 
   async function startStream() {
-    setStatus('Waiting for tab selection...');
+    setStatus('Finding YouTube tab...');
     setCommentary([]);
     setDetection(null);
 
     try {
-      const mediaStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
-
-      streamRef.current = mediaStream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        videoRef.current.muted = true;
-        await videoRef.current.play();
+      // Find the active YouTube tab
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (!tab?.id) {
+        setStatus('No active tab found. Open a YouTube video first.');
+        return;
       }
 
-      mediaStream.getVideoTracks()[0]?.addEventListener('ended', () => {
-        stopStream();
-        setStatus('Sharing stopped. Click "Start Stream" to try again.');
+      if (!tab.url?.includes('youtube.com')) {
+        setStatus('Active tab is not YouTube. Navigate to a YouTube video first.');
+        return;
+      }
+
+      const tabId = tab.id;
+      captureTabIdRef.current = tabId;
+
+      // Ensure the content script is loaded on this tab.
+      // After extension reload, already-open tabs won't have it.
+      setStatus('Injecting capture script...');
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['content-scripts/content.js'],
+        });
+        console.log('[AI Commentator] Content script injected into tab %d', tabId);
+      } catch (injectErr) {
+        // May fail if already injected — that's fine
+        console.log('[AI Commentator] Script injection skipped (may be already loaded):', injectErr);
+      }
+
+      // Small delay to let the content script's onConnect listener register
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Connect to the content script via a port
+      setStatus('Connecting to tab...');
+      const port = chrome.tabs.connect(tabId, { name: 'capture' });
+      capturePortRef.current = port;
+
+      let gotFirstFrame = false;
+
+      // Listen for frames from the content script
+      port.onMessage.addListener((msg) => {
+        if (msg.type === 'FRAME') {
+          if (!gotFirstFrame) {
+            gotFirstFrame = true;
+            console.log('[AI Commentator] First frame received from content script');
+          }
+          handleFrame(msg.data as string, msg.ts as number);
+        } else if (msg.type === 'CAPTURE_ACTIVE') {
+          console.log('[AI Commentator] Content script capture is active');
+          setStatus('Capturing — calibrating sync...');
+        } else if (msg.type === 'ERROR') {
+          setStatus(`Capture error: ${msg.message}`);
+          stopStream();
+        }
+      });
+
+      port.onDisconnect.addListener(() => {
+        console.log('[AI Commentator] Capture port disconnected, lastError:', chrome.runtime.lastError?.message);
+        // Only auto-stop if we were actively streaming
+        if (capturePortRef.current === port) {
+          stopStream();
+          setStatus('Tab disconnected. Click "Start Stream" to reconnect.');
+        }
       });
 
       setStreaming(true);
       setStatus('Connecting to backend...');
+
+      // Open WebSocket to backend
       connectWebSocket();
+
+      // Tell content script to start capturing
+      port.postMessage({ type: 'START_CAPTURE' });
+      console.log('[AI Commentator] Sent START_CAPTURE to content script');
     } catch (err) {
-      console.error('[AI Commentator] Stream error:', err);
-      if (err instanceof Error && err.name === 'NotAllowedError') {
-        setStatus('Cancelled. Click "Start Stream" to try again.');
-      } else {
-        setStatus(`Stream failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      console.error('[AI Commentator] Start error:', err);
+      setStatus(`Failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Handle a frame received from the content script. */
+  function handleFrame(base64: string, ts: number) {
+    const src = `data:image/jpeg;base64,${base64}`;
+
+    // Buffer for delayed playback
+    frameBufferRef.current.push({ src, timestamp: ts });
+    while (frameBufferRef.current.length > MAX_BUFFER_FRAMES) {
+      frameBufferRef.current.shift();
+    }
+
+    // Forward to backend WebSocket as binary
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'frame_ts', ts }));
+      ws.send(base64ToBlob(base64));
     }
   }
 
@@ -245,13 +298,9 @@ export function App() {
       console.log('[AI Commentator] WebSocket connected');
       streamStartRef.current = Date.now();
       setStatus('Calibrating sync — first commentary incoming...');
-      // Send user profile if captured during onboarding
       if (userProfile) {
         ws.send(JSON.stringify({ type: 'set_profile', profile: userProfile }));
       }
-      // Start capturing frames immediately (they buffer for later)
-      startFrameCapture();
-      // NOTE: do NOT start delayed playback yet — wait for calibration
     };
 
     ws.onmessage = (event) => {
@@ -259,7 +308,6 @@ export function App() {
         const msg = JSON.parse(event.data);
 
         if (msg.type === 'status') {
-          // Don't overwrite calibration status while calibrating
           if (calibratedRef.current) {
             setStatus(msg.message);
           }
@@ -275,7 +323,6 @@ export function App() {
           const analyst = msg.analyst || 'Danny';
           const audio = msg.audio || null;
 
-          // Update detection debug overlay immediately
           if (msg.annotated_frame) {
             setDetection((prev) => ({
               annotatedFrame: msg.annotated_frame,
@@ -285,10 +332,8 @@ export function App() {
           }
 
           if (frameTs > 0 && !calibratedRef.current) {
-            // Still calibrating — collect sample and show immediately
             const locked = calibrate(frameTs);
             if (!locked) {
-              // Pre-calibration: show commentary immediately (no sync yet)
               setCommentary((prev) => [
                 { text: msg.text, emotion, analyst, capturedAt: frameTs || Date.now(), displayedAt: Date.now() },
                 ...prev.slice(0, 19),
@@ -303,11 +348,9 @@ export function App() {
           }
 
           if (frameTs > 0 && calibratedRef.current) {
-            // Schedule commentary to appear when delayed video shows this frame
             scheduleCommentary(msg.text, emotion, analyst, audio, frameTs);
             setStatus('Live — synced!');
           } else if (frameTs === 0) {
-            // No sync info — display immediately
             setCommentary((prev) => [
               { text: msg.text, emotion, analyst, capturedAt: frameTs || Date.now(), displayedAt: Date.now() },
               ...prev.slice(0, 19),
@@ -329,99 +372,15 @@ export function App() {
 
     ws.onclose = () => {
       console.log('[AI Commentator] WebSocket closed');
-      stopFrameCapture();
       stopDelayedPlayback();
     };
-  }
-
-  // ---- Frame capture (starts immediately, buffers for delayed playback) ----
-
-  function startFrameCapture() {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    frameCaptureCountRef.current = 0;
-    const intervalMs = 1000 / DISPLAY_FPS;
-
-    captureIntervalRef.current = setInterval(() => {
-      if (video.readyState < video.HAVE_CURRENT_DATA) return;
-
-      let w = video.videoWidth;
-      let h = video.videoHeight;
-      if (w > MAX_CANVAS_WIDTH) {
-        const scale = MAX_CANVAS_WIDTH / w;
-        w = MAX_CANVAS_WIDTH;
-        h = Math.round(h * scale);
-      }
-
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
-
-      ctx.drawImage(video, 0, 0, w, h);
-      frameCaptureCountRef.current++;
-
-      const now = Date.now();
-
-      // Buffer every frame for delayed playback
-      canvas.toBlob(
-        (blob) => {
-          if (!blob) return;
-          frameBufferRef.current.push({
-            blobUrl: URL.createObjectURL(blob),
-            timestamp: now,
-          });
-          while (frameBufferRef.current.length > MAX_BUFFER_FRAMES) {
-            const old = frameBufferRef.current.shift();
-            if (old) URL.revokeObjectURL(old.blobUrl);
-          }
-        },
-        'image/jpeg',
-        0.5,
-      );
-
-      // Send to backend at CAPTURE_FPS rate
-      const ws = wsRef.current;
-      if (
-        ws &&
-        ws.readyState === WebSocket.OPEN &&
-        frameCaptureCountRef.current % BACKEND_SEND_EVERY === 0
-      ) {
-        ws.send(JSON.stringify({ type: 'frame_ts', ts: now }));
-        canvas.toBlob(
-          (blob) => {
-            if (blob && ws.readyState === WebSocket.OPEN) {
-              ws.send(blob);
-            }
-          },
-          'image/jpeg',
-          JPEG_QUALITY,
-        );
-      }
-    }, intervalMs);
-  }
-
-  function stopFrameCapture() {
-    if (captureIntervalRef.current) {
-      clearInterval(captureIntervalRef.current);
-      captureIntervalRef.current = null;
-    }
   }
 
   // ---- Audio playback (queue with graceful handoff) ----
 
   function playNextAudio() {
-    // If something is already playing, let it finish naturally.
-    // The onended callback will pick up the next item in the queue.
-    // Only interrupt if we're falling behind (>2 items queued).
     if (playingAudioRef.current) {
       if (audioQueueRef.current.length > 2 && currentAudioRef.current) {
-        // Falling behind — skip to latest
         while (audioQueueRef.current.length > 1) {
           audioQueueRef.current.shift();
         }
@@ -429,9 +388,7 @@ export function App() {
         currentAudioRef.current.src = '';
         currentAudioRef.current = null;
         playingAudioRef.current = false;
-        // Fall through to play the latest
       } else {
-        // Let current audio finish, queue will be picked up by onended
         return;
       }
     }
@@ -465,23 +422,28 @@ export function App() {
   // ---- Stop everything ----
 
   function stopStream() {
-    stopFrameCapture();
     stopDelayedPlayback();
 
+    // Tell content script to stop and disconnect port
+    if (capturePortRef.current) {
+      try {
+        capturePortRef.current.postMessage({ type: 'STOP_CAPTURE' });
+      } catch {
+        // Port may already be disconnected
+      }
+      capturePortRef.current.disconnect();
+      capturePortRef.current = null;
+    }
+    captureTabIdRef.current = null;
+
+    // Close backend WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'stop' }));
       wsRef.current.close();
     }
     wsRef.current = null;
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-
+    // Stop any playing audio
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current.src = '';
@@ -510,7 +472,6 @@ export function App() {
     Rookie: '#f97316',
   };
 
-  /** Format ms-since-epoch to mm:ss relative to stream start. */
   function fmtTime(ms: number): string {
     const elapsed = Math.max(0, Math.round((ms - streamStartRef.current) / 1000));
     const m = Math.floor(elapsed / 60);
@@ -606,9 +567,6 @@ export function App() {
             )}
           </div>
         </div>
-
-        {/* Hidden video element for real-time capture */}
-        <video ref={videoRef} style={{ display: 'none' }} playsInline muted />
 
         {/* Detection debug overlay */}
         {streaming && (
@@ -747,15 +705,12 @@ export function App() {
             <p style={{ fontSize: 13, color: '#64748b', textAlign: 'center', marginTop: 16, lineHeight: 1.6 }}>
               1. Open a YouTube video in any tab<br />
               2. Click "Start Stream"<br />
-              3. Pick the YouTube tab from Chrome's picker<br />
-              4. AI commentary will appear here
+              3. Commentary + synced video will appear here<br />
+              4. The YouTube tab video will be hidden
             </p>
           </div>
         )}
       </div>
-
-      {/* Hidden canvas */}
-      <canvas ref={canvasRef} style={{ display: 'none' }} />
 
       <style>{`
         body { margin: 0; }
