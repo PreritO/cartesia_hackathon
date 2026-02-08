@@ -99,6 +99,12 @@ class BaseCommentaryPipeline:
         self._ball_was_present = False
         self._consecutive_no_ball = 0
         self._no_ball_threshold = 3
+        self._last_ball_pos: tuple[float, float] | None = None  # (cx, cy) normalized 0-1
+        self._ball_trajectory: list[tuple[float, float]] = []  # recent positions
+
+        # Frame dimensions (set on first detection)
+        self._frame_w = 0
+        self._frame_h = 0
 
         # Last annotated frame (base64 JPEG, sent with commentary)
         self._last_annotated_frame: str | None = None
@@ -133,6 +139,7 @@ class BaseCommentaryPipeline:
             return []
 
         self._frame_count += 1
+        self._frame_h, self._frame_w = img.shape[:2]
         loop = asyncio.get_running_loop()
 
         raw_detections: sv.Detections = await loop.run_in_executor(
@@ -157,8 +164,25 @@ class BaseCommentaryPipeline:
             total_raw = len(raw_detections) if raw_detections else 0
             logger.info(
                 "Frame %d: %d raw detections → %d persons, %d balls",
-                self._frame_count, total_raw, person_count, ball_count,
+                self._frame_count,
+                total_raw,
+                person_count,
+                ball_count,
             )
+
+        # Send annotated frame to frontend every 10 frames (~2s) for debug overlay
+        if self._frame_count % 10 == 0 and self._last_annotated_frame:
+            try:
+                await self.ws.send_json(
+                    {
+                        "type": "detection",
+                        "annotated_frame": self._last_annotated_frame,
+                        "person_count": sum(1 for o in objects if o["label"] == "person"),
+                        "ball_count": sum(1 for o in objects if o["label"] == "sports ball"),
+                    }
+                )
+            except WebSocketDisconnect:
+                self._running = False
 
         return objects
 
@@ -218,18 +242,114 @@ class BaseCommentaryPipeline:
 
     # ---- Ball tracking + commentary ----
 
-    def _build_detection_context(self, objects: list[DetectedObject]) -> str:
-        """Build a text summary of what was detected for the LLM prompt."""
+    def _zone_label(self, cx: float, cy: float) -> str:
+        """Map normalized (0-1) center coords to a pitch zone label."""
+        # Horizontal: left third / center / right third
+        if cx < 0.33:
+            h = "left"
+        elif cx > 0.67:
+            h = "right"
+        else:
+            h = "center"
+        # Vertical: top (far side) / middle / bottom (near side)
+        if cy < 0.33:
+            v = "far side"
+        elif cy > 0.67:
+            v = "near side"
+        else:
+            v = "midfield"
+        return f"{h} {v}"
+
+    def _classify_scene(self, objects: list[DetectedObject]) -> str:
+        """Simple heuristic to classify the current scene type."""
         person_count = sum(1 for o in objects if o["label"] == "person")
         ball_count = sum(1 for o in objects if o["label"] == "sports ball")
+        if person_count >= 6 and ball_count >= 1:
+            return "active_play"
+        if person_count >= 6 and ball_count == 0:
+            return "play_without_ball"
+        if 1 <= person_count <= 3:
+            return "close_up"
+        if person_count == 0:
+            return "no_players"
+        return "transition"
+
+    def _ball_movement_description(self) -> str:
+        """Describe ball movement from recent trajectory."""
+        traj = self._ball_trajectory
+        if len(traj) < 2:
+            return ""
+        prev = traj[-2]
+        curr = traj[-1]
+        dx = curr[0] - prev[0]
+        dy = curr[1] - prev[1]
+        dist = (dx**2 + dy**2) ** 0.5
+
+        if dist < 0.02:
+            return "Ball is nearly stationary."
         parts = []
-        if person_count:
-            parts.append(f"{person_count} players detected")
-        if ball_count:
-            parts.append("ball visible")
+        if abs(dx) > 0.02:
+            parts.append("right" if dx > 0 else "left")
+        if abs(dy) > 0.02:
+            parts.append("downfield" if dy > 0 else "upfield")
+        direction = " and ".join(parts) if parts else "moving"
+        speed = "rapidly" if dist > 0.1 else "steadily"
+        return f"Ball moving {speed} {direction}."
+
+    def _build_detection_context(self, objects: list[DetectedObject]) -> str:
+        """Build a rich text summary of detections for the LLM prompt."""
+        person_count = sum(1 for o in objects if o["label"] == "person")
+        ball_objs = [o for o in objects if o["label"] == "sports ball"]
+        ball_count = len(ball_objs)
+
+        # Scene type
+        scene = self._classify_scene(objects)
+        scene_labels = {
+            "active_play": "Active play",
+            "play_without_ball": "Players on field, ball not visible",
+            "close_up": "Close-up shot",
+            "no_players": "No players visible (crowd/replay/graphic)",
+            "transition": "Transitional shot",
+        }
+        parts = [f"Scene: {scene_labels.get(scene, scene)}."]
+        parts.append(f"{person_count} players detected.")
+
+        # Ball position and zone
+        if ball_count and self._frame_w > 0:
+            ball = ball_objs[0]
+            cx = ((ball["x1"] + ball["x2"]) / 2) / self._frame_w
+            cy = ((ball["y1"] + ball["y2"]) / 2) / self._frame_h
+            zone = self._zone_label(cx, cy)
+            parts.append(f"Ball in the {zone} area.")
+
+            # Track trajectory
+            self._ball_trajectory.append((cx, cy))
+            if len(self._ball_trajectory) > 5:
+                self._ball_trajectory.pop(0)
+            self._last_ball_pos = (cx, cy)
+
+            # Movement description
+            movement = self._ball_movement_description()
+            if movement:
+                parts.append(movement)
         else:
-            parts.append("ball NOT visible in frame")
-        return "Detection: " + ", ".join(parts) + "."
+            parts.append("Ball not visible.")
+            # Don't clear trajectory — we'll use it when ball reappears
+
+        # Player clustering (rough)
+        if person_count >= 4 and self._frame_w > 0:
+            persons = [o for o in objects if o["label"] == "person"]
+            xs = [((o["x1"] + o["x2"]) / 2) / self._frame_w for o in persons]
+            # Check if players are clustered (std dev < 0.15 = tight group)
+            mean_x = sum(xs) / len(xs)
+            spread = (sum((x - mean_x) ** 2 for x in xs) / len(xs)) ** 0.5
+            if spread < 0.15:
+                cluster_zone = self._zone_label(mean_x, 0.5)
+                parts.append(
+                    f"Players clustered in the {cluster_zone} — possible set piece or buildup."
+                )
+
+        return " ".join(parts)
 
     async def _handle_detections(self, objects: list[DetectedObject]) -> None:
         """Ball tracking logic + trigger commentary when appropriate."""
@@ -262,7 +382,9 @@ class BaseCommentaryPipeline:
                 and self._ball_was_present
                 and self._debouncer
             ):
-                logger.info("Ball disappeared for %d frames — one-time comment", self._consecutive_no_ball)
+                logger.info(
+                    "Ball disappeared for %d frames — one-time comment", self._consecutive_no_ball
+                )
                 await self._commentate(
                     f"{det_context} The ball has left the frame. "
                     "Briefly describe what you see — is this a replay, crowd shot, or camera angle change?"

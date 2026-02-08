@@ -1,7 +1,7 @@
 /**
  * Side Panel — streams the active tab's video via getDisplayMedia(),
  * captures frames at 5 FPS, sends them to the backend over WebSocket,
- * and displays commentary text + plays TTS audio.
+ * displays commentary text + plays TTS audio, and shows detection debug overlay.
  */
 
 import { useRef, useState } from 'react';
@@ -12,10 +12,18 @@ interface CommentaryEntry {
   emotion: string;
 }
 
+interface DetectionInfo {
+  annotatedFrame: string;
+  personCount: number;
+  ballCount: number;
+}
+
 export function App() {
   const [status, setStatus] = useState('Click "Start Stream" and pick your YouTube tab.');
   const [streaming, setStreaming] = useState(false);
   const [commentary, setCommentary] = useState<CommentaryEntry[]>([]);
+  const [detection, setDetection] = useState<DetectionInfo | null>(null);
+  const [showDebug, setShowDebug] = useState(true);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -28,6 +36,7 @@ export function App() {
   async function startStream() {
     setStatus('Waiting for tab selection...');
     setCommentary([]);
+    setDetection(null);
 
     try {
       const mediaStream = await navigator.mediaDevices.getDisplayMedia({
@@ -49,8 +58,6 @@ export function App() {
 
       setStreaming(true);
       setStatus('Connecting to backend...');
-
-      // Connect WebSocket and start frame capture
       connectWebSocket();
     } catch (err) {
       console.error('[AI Commentator] Stream error:', err);
@@ -78,16 +85,31 @@ export function App() {
 
         if (msg.type === 'status') {
           setStatus(msg.message);
+        } else if (msg.type === 'detection') {
+          // Live detection debug updates (~every 2s)
+          setDetection({
+            annotatedFrame: msg.annotated_frame,
+            personCount: msg.person_count,
+            ballCount: msg.ball_count,
+          });
         } else if (msg.type === 'commentary') {
           console.log('[AI Commentator] Commentary:', msg.text, `[${msg.emotion}]`);
 
           setCommentary((prev) => [
             { text: msg.text, emotion: msg.emotion || 'neutral' },
-            ...prev.slice(0, 19), // Keep last 20 entries
+            ...prev.slice(0, 19),
           ]);
           setStatus('Streaming + commenting!');
 
-          // Queue audio for playback
+          // Also update detection frame from commentary if available
+          if (msg.annotated_frame) {
+            setDetection((prev) => ({
+              annotatedFrame: msg.annotated_frame,
+              personCount: prev?.personCount ?? 0,
+              ballCount: prev?.ballCount ?? 0,
+            }));
+          }
+
           if (msg.audio) {
             audioQueueRef.current.push(msg.audio);
             playNextAudio();
@@ -123,7 +145,6 @@ export function App() {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (video.readyState < video.HAVE_CURRENT_DATA) return;
 
-      // Scale to max width while preserving aspect ratio
       let w = video.videoWidth;
       let h = video.videoHeight;
       if (w > MAX_CANVAS_WIDTH) {
@@ -167,7 +188,7 @@ export function App() {
     const audio = new Audio(`data:audio/mp3;base64,${base64}`);
     audio.onended = () => {
       playingAudioRef.current = false;
-      playNextAudio(); // Play next in queue
+      playNextAudio();
     };
     audio.onerror = () => {
       playingAudioRef.current = false;
@@ -180,17 +201,14 @@ export function App() {
   }
 
   function stopStream() {
-    // Stop frame capture
     stopFrameCapture();
 
-    // Close WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'stop' }));
       wsRef.current.close();
     }
     wsRef.current = null;
 
-    // Stop media stream
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -199,10 +217,8 @@ export function App() {
       videoRef.current.srcObject = null;
     }
 
-    // Clear audio queue
     audioQueueRef.current = [];
     playingAudioRef.current = false;
-
     setStreaming(false);
   }
 
@@ -243,7 +259,7 @@ export function App() {
       </div>
 
       {/* Video mirror */}
-      <div style={{ padding: '8px 16px' }}>
+      <div style={{ padding: '8px 16px 4px' }}>
         <div
           style={{
             width: '100%',
@@ -271,16 +287,60 @@ export function App() {
         </div>
       </div>
 
+      {/* Detection debug overlay */}
+      {streaming && (
+        <div style={{ padding: '0 16px 4px' }}>
+          <button
+            onClick={() => setShowDebug(!showDebug)}
+            style={{
+              background: 'none', border: 'none', color: '#64748b',
+              fontSize: 11, cursor: 'pointer', padding: '4px 0',
+            }}
+          >
+            {showDebug ? 'Hide' : 'Show'} Detection View
+            {detection && ` (${detection.personCount}p ${detection.ballCount}b)`}
+          </button>
+          {showDebug && detection?.annotatedFrame && (
+            <div
+              style={{
+                width: '100%',
+                aspectRatio: '16/9',
+                borderRadius: 6,
+                overflow: 'hidden',
+                border: '1px solid #334155',
+                position: 'relative',
+              }}
+            >
+              <img
+                src={`data:image/jpeg;base64,${detection.annotatedFrame}`}
+                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                alt="Detection overlay"
+              />
+              <div
+                style={{
+                  position: 'absolute', bottom: 4, left: 4,
+                  background: 'rgba(0,0,0,0.7)', borderRadius: 4,
+                  padding: '2px 6px', fontSize: 10, color: '#94a3b8',
+                }}
+              >
+                {detection.personCount} players
+                {detection.ballCount > 0 ? ' | ball' : ' | no ball'}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Hidden canvas for frame extraction */}
       <canvas ref={canvasRef} style={{ display: 'none' }} />
 
       {/* Controls */}
-      <div style={{ padding: '8px 16px' }}>
+      <div style={{ padding: '4px 16px 8px' }}>
         <button
           onClick={streaming ? () => { stopStream(); setStatus('Stopped.'); } : startStream}
           style={{
             width: '100%',
-            padding: '12px 16px', borderRadius: 8, border: 'none',
+            padding: '10px 16px', borderRadius: 8, border: 'none',
             cursor: 'pointer',
             fontWeight: 600, fontSize: 14,
             backgroundColor: streaming ? '#ef4444' : '#7c3aed',
@@ -297,27 +357,27 @@ export function App() {
           style={{
             flex: 1,
             overflow: 'auto',
-            padding: '8px 16px',
+            padding: '0 16px 8px',
             display: 'flex',
             flexDirection: 'column',
-            gap: 8,
+            gap: 6,
           }}
         >
           {commentary.map((entry, i) => (
             <div
               key={i}
               style={{
-                padding: '8px 12px',
+                padding: '6px 10px',
                 borderRadius: 6,
                 background: '#1e293b',
                 borderLeft: `3px solid ${emotionColor[entry.emotion] || '#cbd5e1'}`,
-                opacity: i === 0 ? 1 : 0.7,
+                opacity: i === 0 ? 1 : 0.6,
               }}
             >
-              <span style={{ fontSize: 10, color: emotionColor[entry.emotion] || '#cbd5e1', textTransform: 'uppercase', fontWeight: 600 }}>
+              <span style={{ fontSize: 9, color: emotionColor[entry.emotion] || '#cbd5e1', textTransform: 'uppercase', fontWeight: 600 }}>
                 {entry.emotion}
               </span>
-              <p style={{ fontSize: 13, margin: '4px 0 0', lineHeight: 1.4, color: '#e2e8f0' }}>
+              <p style={{ fontSize: 12, margin: '2px 0 0', lineHeight: 1.4, color: '#e2e8f0' }}>
                 {entry.text}
               </p>
             </div>
