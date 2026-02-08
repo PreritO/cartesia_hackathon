@@ -8,6 +8,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { BACKEND_WS_URL, CAPTURE_FPS, JPEG_QUALITY, MAX_CANVAS_WIDTH, PIPELINE_DELAY_MS } from '../../lib/constants';
 
+/** Display buffer runs at higher FPS for smooth delayed playback. */
+const DISPLAY_FPS = 15;
+/** Send to backend every Nth display frame to match CAPTURE_FPS. */
+const BACKEND_SEND_EVERY = Math.max(1, Math.round(DISPLAY_FPS / CAPTURE_FPS));
+
 interface CommentaryEntry {
   text: string;
   emotion: string;
@@ -38,11 +43,12 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const delayIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioQueueRef = useRef<string[]>([]);
   const playingAudioRef = useRef(false);
   const frameBufferRef = useRef<BufferedFrame[]>([]);
   const delayMsRef = useRef(delayMs);
+  const rafIdRef = useRef<number | null>(null);
+  const frameCaptureCountRef = useRef(0);
 
   // Keep ref in sync with state
   useEffect(() => {
@@ -50,8 +56,10 @@ export function App() {
   }, [delayMs]);
 
   const startDelayedPlayback = useCallback(() => {
-    // Every 200ms, find the frame that's ~delayMs old and display it
-    delayIntervalRef.current = setInterval(() => {
+    // Use requestAnimationFrame for smooth display updates synced to screen refresh
+    let lastDisplayedUrl: string | null = null;
+
+    function tick() {
       const buffer = frameBufferRef.current;
       const targetTime = Date.now() - delayMsRef.current;
 
@@ -64,8 +72,9 @@ export function App() {
         }
       }
 
-      if (bestIdx >= 0) {
-        setDelayedFrameSrc(buffer[bestIdx].blobUrl);
+      if (bestIdx >= 0 && buffer[bestIdx].blobUrl !== lastDisplayedUrl) {
+        lastDisplayedUrl = buffer[bestIdx].blobUrl;
+        setDelayedFrameSrc(lastDisplayedUrl);
 
         // Revoke and remove all frames before the displayed one
         for (let i = 0; i < bestIdx; i++) {
@@ -73,13 +82,17 @@ export function App() {
         }
         frameBufferRef.current = buffer.slice(bestIdx);
       }
-    }, 200);
+
+      rafIdRef.current = requestAnimationFrame(tick);
+    }
+
+    rafIdRef.current = requestAnimationFrame(tick);
   }, []);
 
   const stopDelayedPlayback = useCallback(() => {
-    if (delayIntervalRef.current) {
-      clearInterval(delayIntervalRef.current);
-      delayIntervalRef.current = null;
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
     }
     // Clean up all buffered frames
     for (const frame of frameBufferRef.current) {
@@ -194,11 +207,13 @@ export function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const intervalMs = 1000 / CAPTURE_FPS;
+    frameCaptureCountRef.current = 0;
+
+    // Run at DISPLAY_FPS (15) for smooth delayed playback.
+    // Send to backend every BACKEND_SEND_EVERY frames (= CAPTURE_FPS rate).
+    const intervalMs = 1000 / DISPLAY_FPS;
 
     captureIntervalRef.current = setInterval(() => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (video.readyState < video.HAVE_CURRENT_DATA) return;
 
       let w = video.videoWidth;
@@ -215,28 +230,45 @@ export function App() {
       }
 
       ctx.drawImage(video, 0, 0, w, h);
+      frameCaptureCountRef.current++;
 
+      const now = Date.now();
+
+      // Buffer every frame for smooth delayed playback (lower quality to save memory)
       canvas.toBlob(
         (blob) => {
           if (!blob) return;
-          // Send to backend
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(blob);
-          }
-          // Also buffer for delayed playback
           frameBufferRef.current.push({
             blobUrl: URL.createObjectURL(blob),
-            timestamp: Date.now(),
+            timestamp: now,
           });
-          // Cap buffer size (~20s of frames at 5fps = 100 frames)
-          while (frameBufferRef.current.length > 100) {
+          // Cap buffer: ~20s at 15 FPS = 300 frames
+          while (frameBufferRef.current.length > 300) {
             const old = frameBufferRef.current.shift();
             if (old) URL.revokeObjectURL(old.blobUrl);
           }
         },
         'image/jpeg',
-        JPEG_QUALITY,
+        0.5,
       );
+
+      // Send to backend at the original CAPTURE_FPS rate (higher quality)
+      const ws = wsRef.current;
+      if (
+        ws &&
+        ws.readyState === WebSocket.OPEN &&
+        frameCaptureCountRef.current % BACKEND_SEND_EVERY === 0
+      ) {
+        canvas.toBlob(
+          (blob) => {
+            if (blob && ws.readyState === WebSocket.OPEN) {
+              ws.send(blob);
+            }
+          },
+          'image/jpeg',
+          JPEG_QUALITY,
+        );
+      }
     }, intervalMs);
   }
 
