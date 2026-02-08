@@ -36,16 +36,54 @@ from agent.user_profile import UserProfile
 logger = logging.getLogger(__name__)
 
 # Load instructions once at module level
-_INSTRUCTIONS_PATH = Path(__file__).parent / "instructions" / "commentary.md"
-INSTRUCTIONS = _INSTRUCTIONS_PATH.read_text()
+_INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
+INSTRUCTIONS_BASE = (_INSTRUCTIONS_DIR / "commentary.md").read_text()
+INSTRUCTIONS_DANNY = (_INSTRUCTIONS_DIR / "danny.md").read_text()
+INSTRUCTIONS_COACH_KAY = (_INSTRUCTIONS_DIR / "coach_kay.md").read_text()
+INSTRUCTIONS_ROOKIE = (_INSTRUCTIONS_DIR / "rookie.md").read_text()
 
-COMMENTARY_PROMPTS = [
-    "What's happening in the match right now? Call it like you see it.",
-    "Provide a play-by-play update based on what you see.",
-    "What is happening on the field right now?",
-    "Read the pitch and tell us what's developing.",
-    "Describe the current situation on the field.",
-]
+# Analyst definitions: name → (prompt, voice_key, scene affinity)
+ANALYSTS = {
+    "danny": {
+        "label": "Danny",
+        "prompt": INSTRUCTIONS_DANNY,
+        "voice_key": "danny",
+        # Danny handles action and transitions
+        "scenes": {"active_play", "play_without_ball", "transition"},
+    },
+    "coach_kay": {
+        "label": "Coach Kay",
+        "prompt": INSTRUCTIONS_COACH_KAY,
+        "voice_key": "coach_kay",
+        # Coach Kay handles tactical lulls, close-ups, replays
+        "scenes": {"close_up", "no_players"},
+    },
+    "rookie": {
+        "label": "Rookie",
+        "prompt": INSTRUCTIONS_ROOKIE,
+        "voice_key": "rookie",
+        # Rookie fills personal moments (selected explicitly)
+        "scenes": set(),
+    },
+}
+
+COMMENTARY_PROMPTS = {
+    "danny": [
+        "Call the action you see right now -- what's happening on the pitch?",
+        "Describe this moment like you're painting a picture for the listener.",
+        "What's developing on the field? Give us the play-by-play.",
+    ],
+    "coach_kay": [
+        "Break down what you see tactically -- formations, shape, strategy.",
+        "What's the tactical story here? Why are the teams set up this way?",
+        "Analyze what just happened or what's developing from a coaching perspective.",
+    ],
+    "rookie": [
+        "React to what's happening like you're watching with a friend. Use any viewer context you have.",
+        "What would you say to the viewer right now? Make it personal and fun.",
+        "Chat about what you see -- bring in any personal connections to the viewer.",
+    ],
+}
 
 # Emotion tag pattern for stripping from TTS text
 _EMOTION_RE = re.compile(r"\[EMOTION:\w+\]\s*")
@@ -128,6 +166,11 @@ class BaseCommentaryPipeline:
         # Recent commentary history (passed to Claude to avoid repetition)
         self._recent_commentary: list[str] = []
 
+        # Multi-analyst rotation state
+        self._commentary_count = 0
+        self._last_analyst: str = "danny"
+        self._last_scene: str = "transition"
+
     def set_profile(self, profile: UserProfile) -> None:
         """Update the user profile (can be called mid-session)."""
         self._profile = profile
@@ -138,9 +181,40 @@ class BaseCommentaryPipeline:
             profile.hot_take_slider,
         )
 
-    def _build_system_prompt(self) -> str:
-        """Build the full system prompt = base instructions + personalization."""
-        prompt = INSTRUCTIONS
+    def _pick_analyst(self, scene: str) -> str:
+        """Pick which analyst speaks based on scene type and rotation.
+
+        Strategy:
+        - Danny (play-by-play): most action scenes — ~55% of commentary
+        - Coach Kay (tactical): lulls, close-ups, replays — ~30%
+        - Rookie (personal): every 4th commentary when viewer has profile — ~15%
+        """
+        self._commentary_count += 1
+
+        # Rookie gets every 4th turn IF the viewer has personal context
+        has_personal = bool(
+            self._profile.favorite_team
+            or self._profile.favorite_players
+            or self._profile.alma_mater
+        )
+        if has_personal and self._commentary_count % 4 == 0:
+            return "rookie"
+
+        # Otherwise pick by scene affinity
+        for key, analyst in ANALYSTS.items():
+            if scene in analyst["scenes"]:
+                # Don't let the same analyst go 3x in a row (except Danny during action)
+                if key == self._last_analyst and key != "danny":
+                    return "danny"
+                return key
+
+        # Default to Danny
+        return "danny"
+
+    def _build_system_prompt(self, analyst_key: str = "danny") -> str:
+        """Build the full system prompt = base + analyst personality + personalization."""
+        analyst = ANALYSTS.get(analyst_key, ANALYSTS["danny"])
+        prompt = INSTRUCTIONS_BASE + "\n\n" + analyst["prompt"]
         profile_block = self._profile.build_prompt_block()
         if profile_block:
             prompt += "\n" + profile_block
@@ -393,15 +467,24 @@ class BaseCommentaryPipeline:
         # Build detection context (always, for enrichment)
         det_context = self._build_detection_context(objects)
 
+        # Track current scene for analyst selection
+        self._last_scene = self._classify_scene(objects)
+
         # Timer-based: when debouncer allows, commentate regardless of detection
         if self._debouncer:
-            prompt = random.choice(COMMENTARY_PROMPTS)
-            await self._commentate(f"{det_context} {prompt}")
+            # Pick analyst based on scene and rotation
+            analyst_key = self._pick_analyst(self._last_scene)
+            self._last_analyst = analyst_key
+
+            prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
+            await self._commentate(f"{det_context} {prompt}", analyst_key=analyst_key)
 
     # ---- LLM + TTS ----
 
-    async def _commentate(self, prompt: str) -> None:
+    async def _commentate(self, prompt: str, analyst_key: str = "danny") -> None:
         """Generate commentary via Claude, synthesize via Cartesia, send over WebSocket."""
+        analyst = ANALYSTS.get(analyst_key, ANALYSTS["danny"])
+
         try:
             # Build prompt with recent history so Claude doesn't repeat itself
             full_prompt = prompt
@@ -413,8 +496,8 @@ class BaseCommentaryPipeline:
                     f"Say something NEW or stay silent if nothing changed."
                 )
 
-            # Generate commentary text
-            text = await self._generate_commentary(full_prompt)
+            # Generate commentary text with this analyst's persona
+            text = await self._generate_commentary(full_prompt, analyst_key=analyst_key)
             if not text:
                 return
 
@@ -422,7 +505,7 @@ class BaseCommentaryPipeline:
             display_text = _EMOTION_RE.sub("", text).strip()
 
             # Track recent commentary
-            self._recent_commentary.append(display_text)
+            self._recent_commentary.append(f"[{analyst['label']}] {display_text}")
             if len(self._recent_commentary) > 5:
                 self._recent_commentary.pop(0)
 
@@ -430,31 +513,37 @@ class BaseCommentaryPipeline:
             emotion_match = re.match(r"\[EMOTION:(\w+)\]", text)
             emotion = emotion_match.group(1) if emotion_match else "neutral"
 
-            # Generate TTS audio
-            audio_bytes = await self._synthesize_speech(display_text, emotion)
+            # Generate TTS audio with this analyst's voice
+            voice_id = self._get_voice_id_for_analyst(analyst_key)
+            audio_bytes = await self._synthesize_speech(display_text, emotion, voice_id=voice_id)
 
-            # Send both text and audio to frontend (include frame_ts for sync)
+            # Send text, audio, and analyst info to frontend
             await self.ws.send_json(
                 {
                     "type": "commentary",
                     "text": display_text,
                     "emotion": emotion,
+                    "analyst": analyst["label"],
                     "audio": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
                     "annotated_frame": self._last_annotated_frame,
                     "frame_ts": self._last_frame_ts,
                 }
             )
 
-            logger.info("Commentary sent: [%s] %s", emotion, display_text[:80])
+            logger.info(
+                "[%s] Commentary sent: [%s] %s",
+                analyst["label"],
+                emotion,
+                display_text[:80],
+            )
 
         except WebSocketDisconnect:
             self._running = False
         except Exception:
             logger.exception("Error generating commentary")
 
-    async def _generate_commentary(self, prompt: str) -> str:
+    async def _generate_commentary(self, prompt: str, analyst_key: str = "danny") -> str:
         """Call Claude with the annotated frame (multimodal) + text prompt."""
-        # Build message content: image first (if available), then text
         content: list[dict[str, Any]] = []
 
         if self._current_frame_b64:
@@ -474,7 +563,7 @@ class BaseCommentaryPipeline:
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=120,
-            system=self._build_system_prompt(),
+            system=self._build_system_prompt(analyst_key=analyst_key),
             messages=[{"role": "user", "content": content}],
         )
         if response.content and response.content[0].type == "text":
@@ -487,17 +576,19 @@ class BaseCommentaryPipeline:
             return text
         return ""
 
-    def _get_voice_id(self) -> str:
-        """Resolve the Cartesia voice ID from the current profile's voice_key."""
+    def _get_voice_id_for_analyst(self, analyst_key: str) -> str:
+        """Get Cartesia voice ID for a specific analyst."""
         voice_map = {
             "danny": config.voice_id_danny,
             "coach_kay": config.voice_id_coach_kay,
             "rookie": config.voice_id_rookie,
         }
-        voice_id = voice_map.get(self._profile.voice_key, config.voice_id_danny)
+        voice_id = voice_map.get(analyst_key, config.voice_id_danny)
         return voice_id or config.voice_id_danny
 
-    async def _synthesize_speech(self, text: str, emotion: str) -> bytes:
+    async def _synthesize_speech(
+        self, text: str, emotion: str, voice_id: str | None = None
+    ) -> bytes:
         """Generate TTS audio via Cartesia Sonic-3."""
         # Map emotion to speed adjustment
         speed_map = {
@@ -510,7 +601,8 @@ class BaseCommentaryPipeline:
         }
         speed = speed_map.get(emotion, 1.0)
 
-        voice_id = self._get_voice_id()
+        if not voice_id:
+            voice_id = self._get_voice_id_for_analyst("danny")
         audio_chunks: list[bytes] = []
         response = self._cartesia.tts.bytes(
             model_id="sonic-3",

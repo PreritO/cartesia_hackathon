@@ -31,6 +31,7 @@ const MAX_BUFFER_FRAMES = 450;
 interface CommentaryEntry {
   text: string;
   emotion: string;
+  analyst: string;
 }
 
 interface DetectionInfo {
@@ -122,20 +123,19 @@ export function App() {
 
   // ---- Schedule commentary to appear when delayed video shows the frame ----
 
-  function scheduleCommentary(text: string, emotion: string, audio: string | null, frameTs: number) {
+  function scheduleCommentary(text: string, emotion: string, analyst: string, audio: string | null, frameTs: number) {
     const displayAt = frameTs + lockedDelayRef.current;
     const waitMs = Math.max(0, displayAt - Date.now());
 
-    console.log('[AI Commentator] Commentary scheduled: waitMs=%dms', waitMs);
+    console.log('[AI Commentator] %s commentary scheduled: waitMs=%dms', analyst, waitMs);
 
     const timerId = setTimeout(() => {
       setCommentary((prev) => [
-        { text, emotion },
+        { text, emotion, analyst },
         ...prev.slice(0, 19),
       ]);
       if (audio) {
         audioQueueRef.current.push(audio);
-        // Always call playNextAudio — it will interrupt stale audio if needed
         playNextAudio();
       }
     }, waitMs);
@@ -270,6 +270,7 @@ export function App() {
         } else if (msg.type === 'commentary') {
           const frameTs = msg.frame_ts || 0;
           const emotion = msg.emotion || 'neutral';
+          const analyst = msg.analyst || 'Danny';
           const audio = msg.audio || null;
 
           // Update detection debug overlay immediately
@@ -287,7 +288,7 @@ export function App() {
             if (!locked) {
               // Pre-calibration: show commentary immediately (no sync yet)
               setCommentary((prev) => [
-                { text: msg.text, emotion },
+                { text: msg.text, emotion, analyst },
                 ...prev.slice(0, 19),
               ]);
               if (audio) {
@@ -301,12 +302,12 @@ export function App() {
 
           if (frameTs > 0 && calibratedRef.current) {
             // Schedule commentary to appear when delayed video shows this frame
-            scheduleCommentary(msg.text, emotion, audio, frameTs);
+            scheduleCommentary(msg.text, emotion, analyst, audio, frameTs);
             setStatus('Live — synced!');
           } else if (frameTs === 0) {
             // No sync info — display immediately
             setCommentary((prev) => [
-              { text: msg.text, emotion },
+              { text: msg.text, emotion, analyst },
               ...prev.slice(0, 19),
             ]);
             if (audio) {
@@ -491,6 +492,12 @@ export function App() {
     disappointed: '#94a3b8',
     thoughtful: '#60a5fa',
     neutral: '#cbd5e1',
+  };
+
+  const analystColor: Record<string, string> = {
+    Danny: '#7c3aed',
+    'Coach Kay': '#0ea5e9',
+    Rookie: '#f97316',
   };
 
   return (
@@ -683,13 +690,24 @@ export function App() {
                   padding: '6px 10px',
                   borderRadius: 6,
                   background: '#1e293b',
-                  borderLeft: `3px solid ${emotionColor[entry.emotion] || '#cbd5e1'}`,
+                  borderLeft: `3px solid ${analystColor[entry.analyst] || '#7c3aed'}`,
                   opacity: i === 0 ? 1 : 0.6,
                 }}
               >
-                <span style={{ fontSize: 9, color: emotionColor[entry.emotion] || '#cbd5e1', textTransform: 'uppercase', fontWeight: 600 }}>
-                  {entry.emotion}
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{
+                    fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+                    color: analystColor[entry.analyst] || '#7c3aed',
+                  }}>
+                    {entry.analyst}
+                  </span>
+                  <span style={{
+                    fontSize: 8, color: emotionColor[entry.emotion] || '#cbd5e1',
+                    textTransform: 'uppercase', opacity: 0.8,
+                  }}>
+                    {entry.emotion}
+                  </span>
+                </div>
                 <p style={{ fontSize: 12, margin: '2px 0 0', lineHeight: 1.4, color: '#e2e8f0' }}>
                   {entry.text}
                 </p>
