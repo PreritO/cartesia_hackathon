@@ -21,8 +21,10 @@ const DELAY_BUFFER_MS = 2500;
 const MIN_DELAY_MS = 3000;
 /** Number of commentaries to sample before locking delay. */
 const CALIBRATION_SAMPLES = 2;
-/** Max frames in buffer (~60s at 5 FPS). */
-const MAX_BUFFER_FRAMES = 300;
+/** Max frames in buffer (~60s at 15 FPS). */
+const MAX_BUFFER_FRAMES = 900;
+/** Send every Nth frame to backend (15 FPS / 5 = 3 FPS to Claude). */
+const BACKEND_SEND_EVERY = 5;
 
 /** Convert a base64 string to a Blob for WebSocket binary send. */
 function base64ToBlob(b64: string, mime = 'image/jpeg'): Blob {
@@ -72,6 +74,7 @@ export function App() {
   const playingAudioRef = useRef(false);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const frameBufferRef = useRef<BufferedFrame[]>([]);
+  const frameCountRef = useRef(0);
   const rafIdRef = useRef<number | null>(null);
   const commentaryTimerIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const streamStartRef = useRef(0);
@@ -275,6 +278,7 @@ export function App() {
       connectWebSocket();
 
       // Tell content script to start capturing
+      frameCountRef.current = 0;
       port.postMessage({ type: 'START_CAPTURE' });
       console.log('[AI Commentator] Sent START_CAPTURE to content script');
     } catch (err) {
@@ -287,17 +291,20 @@ export function App() {
   function handleFrame(base64: string, ts: number) {
     const src = `data:image/jpeg;base64,${base64}`;
 
-    // Buffer for delayed playback
+    // Buffer ALL frames for smooth delayed playback (15 FPS)
     frameBufferRef.current.push({ src, timestamp: ts });
     while (frameBufferRef.current.length > MAX_BUFFER_FRAMES) {
       frameBufferRef.current.shift();
     }
 
-    // Forward to backend WebSocket as binary
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'frame_ts', ts }));
-      ws.send(base64ToBlob(base64));
+    // Forward every Nth frame to backend for detection + commentary (3 FPS)
+    frameCountRef.current++;
+    if (frameCountRef.current % BACKEND_SEND_EVERY === 0) {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'frame_ts', ts }));
+        ws.send(base64ToBlob(base64));
+      }
     }
   }
 

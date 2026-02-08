@@ -11,8 +11,8 @@
  * video and frame capture in sync with the sidebar's play/pause controls.
  */
 
-const CAPTURE_FPS = 5;
-const JPEG_QUALITY = 0.7;
+const CAPTURE_FPS = 15;
+const JPEG_QUALITY = 0.5;
 const MAX_WIDTH = 1280;
 
 let captureInterval: ReturnType<typeof setInterval> | null = null;
