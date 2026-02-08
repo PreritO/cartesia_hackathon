@@ -57,6 +57,7 @@ interface BufferedFrame {
 export function App() {
   const [view, setView] = useState<'setup' | 'stream'>('setup');
   const [userProfile, setUserProfile] = useState<UserProfileData | null>(null);
+  const [sport, setSport] = useState<'soccer' | 'football'>('football');
   const [status, setStatus] = useState('Click "Start Stream" to begin.');
   const [streaming, setStreaming] = useState(false);
   const [calibrated, setCalibrated] = useState(false);
@@ -316,6 +317,8 @@ export function App() {
       console.log('[AI Commentator] WebSocket connected');
       streamStartRef.current = Date.now();
       setStatus('Calibrating sync — first commentary incoming...');
+      // Send sport selection first, then profile
+      ws.send(JSON.stringify({ type: 'set_sport', sport }));
       if (userProfile) {
         ws.send(JSON.stringify({ type: 'set_profile', profile: userProfile }));
       }
@@ -756,8 +759,37 @@ export function App() {
           </div>
         )}
 
-        {/* Controls */}
-        <div style={{ padding: '4px 16px 8px' }}>
+        {/* Sport selector + Controls */}
+        <div style={{ padding: '4px 16px 8px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {/* Sport toggle */}
+          <div style={{
+            display: 'flex', borderRadius: 8, overflow: 'hidden',
+            border: '1px solid #334155',
+          }}>
+            {(['football', 'soccer'] as const).map((s) => (
+              <button
+                key={s}
+                onClick={() => {
+                  setSport(s);
+                  // If already streaming, send sport change to backend
+                  const ws = wsRef.current;
+                  if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'set_sport', sport: s }));
+                  }
+                }}
+                style={{
+                  flex: 1, padding: '6px 0', border: 'none', cursor: 'pointer',
+                  fontSize: 12, fontWeight: 600,
+                  background: sport === s ? '#7c3aed' : '#1e293b',
+                  color: sport === s ? 'white' : '#64748b',
+                  transition: 'background 0.15s, color 0.15s',
+                }}
+              >
+                {s === 'football' ? 'Football' : 'Soccer'}
+              </button>
+            ))}
+          </div>
+
           <button
             onClick={streaming ? () => { stopStream(); setStatus('Stopped.'); } : startStream}
             style={{

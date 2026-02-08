@@ -32,16 +32,26 @@ class UserProfile:
     hometown_connections: list[str] = field(default_factory=list)
     fun_facts: list[str] = field(default_factory=list)
 
-    def get_expertise_description(self) -> str:
+    def get_expertise_description(self, sport: str = "soccer") -> str:
         """Convert expertise slider to description."""
-        if self.expertise_slider < 20:
-            return "Complete beginner — explain everything simply, define terms like offside, free kick, etc."
-        elif self.expertise_slider < 50:
-            return "Casual fan — knows the basics, explain complex plays and tactics"
-        elif self.expertise_slider < 80:
-            return "Knowledgeable — appreciates tactical analysis, use real football language"
+        if sport == "football":
+            if self.expertise_slider < 20:
+                return "Complete beginner — explain everything simply, define terms like downs, first down, touchdown, field goal, etc."
+            elif self.expertise_slider < 50:
+                return "Casual fan — knows the basics, explain formations, play types, and penalties"
+            elif self.expertise_slider < 80:
+                return "Knowledgeable — appreciates X's and O's, coverage schemes, route concepts"
+            else:
+                return "Film room nerd — loves pre-snap reads, blitz packages, RPOs, coverage shells, advanced football analytics"
         else:
-            return "Film room nerd — loves formations, pressing triggers, expected goals, deep tactical breakdowns"
+            if self.expertise_slider < 20:
+                return "Complete beginner — explain everything simply, define terms like offside, free kick, etc."
+            elif self.expertise_slider < 50:
+                return "Casual fan — knows the basics, explain complex plays and tactics"
+            elif self.expertise_slider < 80:
+                return "Knowledgeable — appreciates tactical analysis, use real football language"
+            else:
+                return "Film room nerd — loves formations, pressing triggers, expected goals, deep tactical breakdowns"
 
     def get_style_instruction(self) -> str:
         """Get commentary style based on hot take slider."""
@@ -64,7 +74,7 @@ class UserProfile:
             connections.append(f"Hometown connections: {', '.join(self.hometown_connections[:2])}")
         return "; ".join(connections) if connections else ""
 
-    def build_prompt_block(self) -> str:
+    def build_prompt_block(self, sport: str = "soccer") -> str:
         """Build a personalization block to append to the system prompt."""
         lines = ["\n## Viewer Profile\n"]
         lines.append(f"- **Name:** {self.name}")
@@ -74,7 +84,7 @@ class UserProfile:
             if self.rival_team:
                 lines.append(f"- **Rival team:** {self.rival_team}")
 
-        lines.append(f"- **Expertise:** {self.get_expertise_description()}")
+        lines.append(f"- **Expertise:** {self.get_expertise_description(sport=sport)}")
         lines.append(f"- **Commentary style:** {self.get_style_instruction()}")
 
         connections = self.get_connections_summary()
@@ -106,6 +116,7 @@ class UserProfile:
 # ---- Pre-defined Personas ----
 
 PERSONAS: dict[str, UserProfile] = {
+    # Soccer personas
     "casual_fan": UserProfile(
         name="Alex",
         favorite_team="Barcelona",
@@ -139,5 +150,40 @@ PERSONAS: dict[str, UserProfile] = {
         hot_take_slider=90,
         voice_key="danny",
         favorite_players=["Mohamed Salah", "Virgil van Dijk"],
+    ),
+    # American Football personas
+    "football_casual": UserProfile(
+        name="Alex",
+        favorite_team="Kansas City Chiefs",
+        expertise_slider=35,
+        hot_take_slider=45,
+        voice_key="danny",
+        favorite_players=["Patrick Mahomes", "Travis Kelce"],
+    ),
+    "football_newbie": UserProfile(
+        name="Jordan",
+        expertise_slider=10,
+        hot_take_slider=20,
+        voice_key="rookie",
+        interests=["learning the rules", "understanding positions and downs"],
+    ),
+    "football_film_nerd": UserProfile(
+        name="Sam",
+        favorite_team="San Francisco 49ers",
+        rival_team="Dallas Cowboys",
+        expertise_slider=95,
+        hot_take_slider=30,
+        voice_key="coach_kay",
+        favorite_players=["Brock Purdy", "Nick Bosa", "Christian McCaffrey"],
+        interests=["coverage schemes", "run-pass options", "blitz packages"],
+    ),
+    "football_homer": UserProfile(
+        name="Danny",
+        favorite_team="Philadelphia Eagles",
+        rival_team="Dallas Cowboys",
+        expertise_slider=60,
+        hot_take_slider=90,
+        voice_key="danny",
+        favorite_players=["Jalen Hurts", "Saquon Barkley"],
     ),
 }

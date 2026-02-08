@@ -126,7 +126,7 @@ feel like an interview checklist.
 You need to find out:
 1. The viewer's first name
 2. Their favorite team (if any -- it's okay if they don't have one)
-3. Their experience level with soccer (beginner, casual, knowledgeable, or expert)
+3. Their experience level with the sport (beginner, casual, knowledgeable, or expert)
 4. Any favorite players they love watching
 5. How they want the commentary style -- balanced/objective, a bit biased toward \
 their team, or full homer mode
@@ -460,7 +460,7 @@ async def live_commentary_ws(ws: WebSocket):
     session_id = str(uuid.uuid4())[:8]
     logger.info("Live WebSocket connected: session %s", session_id)
 
-    pipeline = LiveCommentaryPipeline(ws=ws, skip_detection=config.skip_detection)
+    pipeline = LiveCommentaryPipeline(ws=ws, skip_detection=config.skip_detection, sport="soccer")
     _active_live_pipelines[session_id] = pipeline
 
     try:
@@ -501,6 +501,14 @@ async def live_commentary_ws(ws: WebSocket):
                 elif msg_type == "frame_ts":
                     # Capture timestamp from frontend for sync with delayed playback
                     pipeline._last_frame_ts = data.get("ts", 0.0)
+
+                elif msg_type == "set_sport":
+                    # Switch sport mid-session
+                    sport = data.get("sport", "soccer")
+                    pipeline.set_sport(sport)
+                    await ws.send_json(
+                        {"type": "status", "message": f"Sport set: {sport}"}
+                    )
 
                 elif msg_type == "set_profile":
                     # Set a custom profile from JSON

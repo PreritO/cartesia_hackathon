@@ -35,39 +35,41 @@ from agent.user_profile import UserProfile
 
 logger = logging.getLogger(__name__)
 
-# Load instructions once at module level
-_INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
-INSTRUCTIONS_BASE = (_INSTRUCTIONS_DIR / "commentary.md").read_text()
-INSTRUCTIONS_DANNY = (_INSTRUCTIONS_DIR / "danny.md").read_text()
-INSTRUCTIONS_COACH_KAY = (_INSTRUCTIONS_DIR / "coach_kay.md").read_text()
-INSTRUCTIONS_ROOKIE = (_INSTRUCTIONS_DIR / "rookie.md").read_text()
+# ---- Sport-specific instruction loading ----
 
-# Analyst definitions: name → (prompt, voice_key, scene affinity)
-ANALYSTS = {
-    "danny": {
-        "label": "Danny",
-        "prompt": INSTRUCTIONS_DANNY,
-        "voice_key": "danny",
-        # Danny handles action and transitions
-        "scenes": {"active_play", "play_without_ball", "transition"},
+_INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
+
+# Soccer (default)
+INSTRUCTIONS_BASE_SOCCER = (_INSTRUCTIONS_DIR / "commentary.md").read_text()
+INSTRUCTIONS_DANNY_SOCCER = (_INSTRUCTIONS_DIR / "danny.md").read_text()
+INSTRUCTIONS_COACH_KAY_SOCCER = (_INSTRUCTIONS_DIR / "coach_kay.md").read_text()
+INSTRUCTIONS_ROOKIE_SOCCER = (_INSTRUCTIONS_DIR / "rookie.md").read_text()
+
+# American Football
+INSTRUCTIONS_BASE_FOOTBALL = (_INSTRUCTIONS_DIR / "commentary_football.md").read_text()
+INSTRUCTIONS_DANNY_FOOTBALL = (_INSTRUCTIONS_DIR / "danny_football.md").read_text()
+INSTRUCTIONS_COACH_KAY_FOOTBALL = (_INSTRUCTIONS_DIR / "coach_kay_football.md").read_text()
+INSTRUCTIONS_ROOKIE_FOOTBALL = (_INSTRUCTIONS_DIR / "rookie_football.md").read_text()
+
+# Supported sports
+SUPPORTED_SPORTS = {"soccer", "football"}
+
+_INSTRUCTIONS_BY_SPORT: dict[str, dict[str, str]] = {
+    "soccer": {
+        "base": INSTRUCTIONS_BASE_SOCCER,
+        "danny": INSTRUCTIONS_DANNY_SOCCER,
+        "coach_kay": INSTRUCTIONS_COACH_KAY_SOCCER,
+        "rookie": INSTRUCTIONS_ROOKIE_SOCCER,
     },
-    "coach_kay": {
-        "label": "Coach Kay",
-        "prompt": INSTRUCTIONS_COACH_KAY,
-        "voice_key": "coach_kay",
-        # Coach Kay handles tactical lulls, close-ups, replays
-        "scenes": {"close_up", "no_players"},
-    },
-    "rookie": {
-        "label": "Rookie",
-        "prompt": INSTRUCTIONS_ROOKIE,
-        "voice_key": "rookie",
-        # Rookie fills personal moments (selected explicitly)
-        "scenes": set(),
+    "football": {
+        "base": INSTRUCTIONS_BASE_FOOTBALL,
+        "danny": INSTRUCTIONS_DANNY_FOOTBALL,
+        "coach_kay": INSTRUCTIONS_COACH_KAY_FOOTBALL,
+        "rookie": INSTRUCTIONS_ROOKIE_FOOTBALL,
     },
 }
 
-COMMENTARY_PROMPTS = {
+COMMENTARY_PROMPTS_SOCCER = {
     "danny": [
         "Call the action you see right now -- what's happening on the pitch?",
         "Describe this moment like you're painting a picture for the listener.",
@@ -84,6 +86,58 @@ COMMENTARY_PROMPTS = {
         "Chat about what you see -- bring in any personal connections to the viewer.",
     ],
 }
+
+COMMENTARY_PROMPTS_FOOTBALL = {
+    "danny": [
+        "Call the play you see -- formation, snap, what's happening on the field right now.",
+        "Describe this play like you're painting the picture for the audience at home.",
+        "What just happened? Give us the play-by-play -- yards, tackle, result.",
+    ],
+    "coach_kay": [
+        "Break down what you see -- offensive formation, defensive alignment, coverage shell.",
+        "What's the tactical story here? Why did they call this play in this situation?",
+        "Analyze what just happened from a coaching perspective -- scheme, execution, adjustments.",
+    ],
+    "rookie": [
+        "React to what's happening like you're watching with a friend. Use any viewer context you have.",
+        "What would you say to the viewer right now? Make it personal and fun.",
+        "Chat about what you see -- bring in any personal connections to the viewer.",
+    ],
+}
+
+COMMENTARY_PROMPTS_BY_SPORT: dict[str, dict[str, list[str]]] = {
+    "soccer": COMMENTARY_PROMPTS_SOCCER,
+    "football": COMMENTARY_PROMPTS_FOOTBALL,
+}
+
+
+def _build_analysts(sport: str) -> dict[str, dict]:
+    """Build analyst definitions for a given sport."""
+    instructions = _INSTRUCTIONS_BY_SPORT.get(sport, _INSTRUCTIONS_BY_SPORT["soccer"])
+    return {
+        "danny": {
+            "label": "Danny",
+            "prompt": instructions["danny"],
+            "voice_key": "danny",
+            "scenes": {"active_play", "play_without_ball", "transition"},
+        },
+        "coach_kay": {
+            "label": "Coach Kay",
+            "prompt": instructions["coach_kay"],
+            "voice_key": "coach_kay",
+            "scenes": {"close_up", "no_players"},
+        },
+        "rookie": {
+            "label": "Rookie",
+            "prompt": instructions["rookie"],
+            "voice_key": "rookie",
+            "scenes": set(),
+        },
+    }
+
+
+# Default analysts (soccer) for backwards compatibility
+ANALYSTS = _build_analysts("soccer")
 
 # Emotion tag pattern for stripping from TTS text
 _EMOTION_RE = re.compile(r"\[EMOTION:\w+\]\s*")
@@ -118,9 +172,21 @@ class BaseCommentaryPipeline:
         ws: WebSocket connection to stream results to the frontend.
     """
 
-    def __init__(self, ws: WebSocket, profile: UserProfile | None = None) -> None:
+    def __init__(
+        self, ws: WebSocket, profile: UserProfile | None = None, sport: str = "soccer"
+    ) -> None:
         self.ws = ws
         self._running = False
+
+        # Sport type (soccer or football)
+        self._sport: str = sport if sport in SUPPORTED_SPORTS else "soccer"
+        self._analysts = _build_analysts(self._sport)
+        self._commentary_prompts = COMMENTARY_PROMPTS_BY_SPORT.get(
+            self._sport, COMMENTARY_PROMPTS_SOCCER
+        )
+        self._instructions = _INSTRUCTIONS_BY_SPORT.get(
+            self._sport, _INSTRUCTIONS_BY_SPORT["soccer"]
+        )
 
         # User profile for personalized commentary
         self._profile: UserProfile = profile or UserProfile()
@@ -181,6 +247,21 @@ class BaseCommentaryPipeline:
             profile.hot_take_slider,
         )
 
+    def set_sport(self, sport: str) -> None:
+        """Switch sport mid-session (reconfigures instructions and prompts)."""
+        if sport not in SUPPORTED_SPORTS:
+            logger.warning("Unsupported sport: %s (keeping %s)", sport, self._sport)
+            return
+        self._sport = sport
+        self._analysts = _build_analysts(sport)
+        self._commentary_prompts = COMMENTARY_PROMPTS_BY_SPORT.get(
+            sport, COMMENTARY_PROMPTS_SOCCER
+        )
+        self._instructions = _INSTRUCTIONS_BY_SPORT.get(
+            sport, _INSTRUCTIONS_BY_SPORT["soccer"]
+        )
+        logger.info("Sport switched to: %s", sport)
+
     def _pick_analyst(self, scene: str) -> str:
         """Pick which analyst speaks based on scene type and rotation.
 
@@ -201,7 +282,7 @@ class BaseCommentaryPipeline:
             return "rookie"
 
         # Otherwise pick by scene affinity
-        for key, analyst in ANALYSTS.items():
+        for key, analyst in self._analysts.items():
             if scene in analyst["scenes"]:
                 # Don't let the same analyst go 3x in a row (except Danny during action)
                 if key == self._last_analyst and key != "danny":
@@ -213,9 +294,9 @@ class BaseCommentaryPipeline:
 
     def _build_system_prompt(self, analyst_key: str = "danny") -> str:
         """Build the full system prompt = base + analyst personality + personalization."""
-        analyst = ANALYSTS.get(analyst_key, ANALYSTS["danny"])
-        prompt = INSTRUCTIONS_BASE + "\n\n" + analyst["prompt"]
-        profile_block = self._profile.build_prompt_block()
+        analyst = self._analysts.get(analyst_key, self._analysts["danny"])
+        prompt = self._instructions["base"] + "\n\n" + analyst["prompt"]
+        profile_block = self._profile.build_prompt_block(sport=self._sport)
         if profile_block:
             prompt += "\n" + profile_block
         return prompt
@@ -342,7 +423,7 @@ class BaseCommentaryPipeline:
     # ---- Ball tracking + commentary ----
 
     def _zone_label(self, cx: float, cy: float) -> str:
-        """Map normalized (0-1) center coords to a pitch zone label."""
+        """Map normalized (0-1) center coords to a field zone label."""
         # Horizontal: left third / center / right third
         if cx < 0.33:
             h = "left"
@@ -350,13 +431,26 @@ class BaseCommentaryPipeline:
             h = "right"
         else:
             h = "center"
-        # Vertical: top (far side) / middle / bottom (near side)
-        if cy < 0.33:
-            v = "far side"
-        elif cy > 0.67:
-            v = "near side"
+
+        if self._sport == "football":
+            # American football: end zone / red zone / midfield / own territory
+            if cy < 0.15 or cy > 0.85:
+                v = "end zone"
+            elif cy < 0.30 or cy > 0.70:
+                v = "red zone"
+            elif 0.40 < cy < 0.60:
+                v = "midfield"
+            else:
+                v = "between the 30s"
         else:
-            v = "midfield"
+            # Soccer: far side / midfield / near side
+            if cy < 0.33:
+                v = "far side"
+            elif cy > 0.67:
+                v = "near side"
+            else:
+                v = "midfield"
+
         return f"{h} {v}"
 
     def _classify_scene(self, objects: list[DetectedObject]) -> str:
@@ -444,9 +538,14 @@ class BaseCommentaryPipeline:
             spread = (sum((x - mean_x) ** 2 for x in xs) / len(xs)) ** 0.5
             if spread < 0.15:
                 cluster_zone = self._zone_label(mean_x, 0.5)
-                parts.append(
-                    f"Players clustered in the {cluster_zone} — possible set piece or buildup."
-                )
+                if self._sport == "football":
+                    parts.append(
+                        f"Players clustered in the {cluster_zone} — possible huddle, goal-line, or short-yardage situation."
+                    )
+                else:
+                    parts.append(
+                        f"Players clustered in the {cluster_zone} — possible set piece or buildup."
+                    )
 
         return " ".join(parts)
 
@@ -478,7 +577,8 @@ class BaseCommentaryPipeline:
             analyst_key = self._pick_analyst(self._last_scene)
             self._last_analyst = analyst_key
 
-            prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
+            prompts = self._commentary_prompts.get(analyst_key, self._commentary_prompts["danny"])
+            prompt = random.choice(prompts)
             await self._commentate(
                 f"{det_context} {prompt}", analyst_key=analyst_key, frame_ts=snapshot_ts
             )
@@ -489,7 +589,7 @@ class BaseCommentaryPipeline:
         self, prompt: str, analyst_key: str = "danny", frame_ts: float | None = None
     ) -> None:
         """Generate commentary via Claude, synthesize via Cartesia, send over WebSocket."""
-        analyst = ANALYSTS.get(analyst_key, ANALYSTS["danny"])
+        analyst = self._analysts.get(analyst_key, self._analysts["danny"])
         # Snapshot frame_ts NOW (before async calls overwrite _last_frame_ts)
         captured_frame_ts = frame_ts if frame_ts is not None else self._last_frame_ts
 
@@ -724,8 +824,9 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
         ws: WebSocket,
         profile: UserProfile | None = None,
         skip_detection: bool = True,
+        sport: str = "soccer",
     ) -> None:
-        super().__init__(ws, profile=profile)
+        super().__init__(ws, profile=profile, sport=sport)
         self._skip_detection = skip_detection
 
     async def initialize(self) -> None:
@@ -755,9 +856,15 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
                 snapshot_ts = self._last_frame_ts
                 analyst_key = self._pick_analyst("active_play")
                 self._last_analyst = analyst_key
-                prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
+                prompts = self._commentary_prompts.get(
+                    analyst_key, self._commentary_prompts["danny"]
+                )
+                prompt = random.choice(prompts)
+                sport_label = (
+                    "American football game" if self._sport == "football" else "soccer match"
+                )
                 await self._commentate(
-                    f"Describe what you see in this soccer match frame. {prompt}",
+                    f"Describe what you see in this {sport_label} frame. {prompt}",
                     analyst_key=analyst_key,
                     frame_ts=snapshot_ts,
                 )
