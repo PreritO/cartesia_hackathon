@@ -492,8 +492,9 @@ class BaseCommentaryPipeline:
                 history = "\n".join(f"- {line}" for line in self._recent_commentary[-3:])
                 full_prompt = (
                     f"{prompt}\n\n"
-                    f"You just said (DO NOT repeat these):\n{history}\n"
-                    f"Say something NEW or stay silent if nothing changed."
+                    f"Recent commentary from the broadcast booth (DO NOT repeat):\n{history}\n"
+                    f"Build on what your colleagues said or move the commentary forward. "
+                    f"If nothing new to add, respond with SKIP."
                 )
 
             # Generate commentary text with this analyst's persona
@@ -592,14 +593,14 @@ class BaseCommentaryPipeline:
         """Generate TTS audio via Cartesia Sonic-3."""
         # Map emotion to speed adjustment
         speed_map = {
-            "excited": 1.2,
-            "tense": 1.1,
-            "thoughtful": 0.9,
-            "celebratory": 1.15,
-            "disappointed": 0.85,
-            "urgent": 1.2,
+            "excited": 1.5,
+            "tense": 1.4,
+            "thoughtful": 1.3,
+            "celebratory": 1.5,
+            "disappointed": 1.2,
+            "urgent": 1.4,
         }
-        speed = speed_map.get(emotion, 1.0)
+        speed = speed_map.get(emotion, 1.3)
 
         if not voice_id:
             voice_id = self._get_voice_id_for_analyst("danny")

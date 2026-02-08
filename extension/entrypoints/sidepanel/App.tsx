@@ -411,25 +411,33 @@ export function App() {
     }
   }
 
-  // ---- Audio playback (interrupt-based, not queue-based) ----
+  // ---- Audio playback (queue with graceful handoff) ----
 
   function playNextAudio() {
-    // If queue has >1 item, skip to latest (don't pile up stale audio)
-    while (audioQueueRef.current.length > 1) {
-      audioQueueRef.current.shift();
+    // If something is already playing, let it finish naturally.
+    // The onended callback will pick up the next item in the queue.
+    // Only interrupt if we're falling behind (>2 items queued).
+    if (playingAudioRef.current) {
+      if (audioQueueRef.current.length > 2 && currentAudioRef.current) {
+        // Falling behind — skip to latest
+        while (audioQueueRef.current.length > 1) {
+          audioQueueRef.current.shift();
+        }
+        currentAudioRef.current.pause();
+        currentAudioRef.current.src = '';
+        currentAudioRef.current = null;
+        playingAudioRef.current = false;
+        // Fall through to play the latest
+      } else {
+        // Let current audio finish, queue will be picked up by onended
+        return;
+      }
     }
 
     const base64 = audioQueueRef.current.shift();
     if (!base64) {
       playingAudioRef.current = false;
       return;
-    }
-
-    // Interrupt any currently playing audio
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current.src = '';
-      currentAudioRef.current = null;
     }
 
     playingAudioRef.current = true;
