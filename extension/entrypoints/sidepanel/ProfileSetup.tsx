@@ -20,201 +20,119 @@ export interface ProfileSetupProps {
   onSkip: () => void;
 }
 
-interface ChatMessage {
-  role: 'assistant' | 'user';
-  text: string;
+const BACKEND_URL = 'http://localhost:8000';
+const AGENT_ID = 'agent_DjLxh2mFbRjouYAXQVGpzr';
+const SAMPLE_RATE = 44100;
+const COMPLETION_PHRASE = "i've got the full picture";
+
+// ---------------------------------------------------------------------------
+// Audio helpers
+// ---------------------------------------------------------------------------
+
+/** Convert a Float32Array of PCM samples to 16-bit PCM and base64 encode. */
+function float32ToBase64Pcm(samples: Float32Array): string {
+  const buf = new ArrayBuffer(samples.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
-interface ProfileChatResponse {
-  text: string;
-  audio: string | null;
-  done: boolean;
-  profile: UserProfileData | null;
+/** Decode base64 PCM (16-bit signed LE) to Float32Array. */
+function base64PcmToFloat32(b64: string): Float32Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const view = new DataView(bytes.buffer);
+  const samples = new Float32Array(bytes.length / 2);
+  for (let i = 0; i < samples.length; i++) {
+    samples[i] = view.getInt16(i * 2, true) / 0x8000;
+  }
+  return samples;
 }
-
-const API_URL = 'http://localhost:8000/api/profile-chat';
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [inputText, setInputText] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
+  const [status, setStatus] = useState('Connecting to Danny...');
+  const [isActive, setIsActive] = useState(false);
+  const [isMicOn, setIsMicOn] = useState(false);
+  const [transcriptLines, setTranscriptLines] = useState<{ role: string; text: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const recognitionRef = useRef<any>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const mountedRef = useRef(true);
   const initCalledRef = useRef(false);
+  const streamIdRef = useRef<string>('');
+  const transcriptRef = useRef('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // ---- Auto-scroll to latest message ----
+  // Gapless audio scheduling: schedule each chunk to start exactly when
+  // the previous one ends, using AudioContext.currentTime for precision.
+  const nextPlayTimeRef = useRef(0);
 
-  const scrollToBottom = useCallback(() => {
+  // ---- Auto-scroll ----
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [transcriptLines]);
+
+  // ---- Schedule agent audio chunk for gapless playback ----
+  const scheduleAudioChunk = useCallback((samples: Float32Array) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx || samples.length === 0) return;
+
+    const buf = ctx.createBuffer(1, samples.length, SAMPLE_RATE);
+    buf.copyToChannel(samples, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+
+    // Schedule this chunk right after the previous one ends (gapless).
+    // If we've fallen behind (nextPlayTime < now), start immediately.
+    const now = ctx.currentTime;
+    const startAt = Math.max(now, nextPlayTimeRef.current);
+    src.start(startAt);
+    nextPlayTimeRef.current = startAt + buf.duration;
   }, []);
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading, scrollToBottom]);
+  // ---- Connect to Cartesia voice agent ----
+  const connect = useCallback(async () => {
+    setError(null);
+    setStatus('Getting access token...');
 
-  // ---- API call to backend ----
-
-  const sendToBackend = useCallback(
-    async (conversationHistory: ChatMessage[]): Promise<ProfileChatResponse | null> => {
-      try {
-        const res = await fetch(API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: conversationHistory }),
-        });
-
-        if (!res.ok) {
-          throw new Error(`Server responded with ${res.status}`);
-        }
-
-        return (await res.json()) as ProfileChatResponse;
-      } catch (err) {
-        console.error('[ProfileSetup] API error:', err);
-        setError(err instanceof Error ? err.message : String(err));
-        return null;
-      }
-    },
-    [],
-  );
-
-  // ---- Audio playback ----
-
-  const playAudio = useCallback((base64Audio: string) => {
+    // 1. Get access token from our backend
+    let token: string;
     try {
-      const audio = new Audio(`data:audio/mp3;base64,${base64Audio}`);
-      audio.play().catch((err) => {
-        console.warn('[ProfileSetup] Audio playback failed:', err);
-      });
+      const res = await fetch(`${BACKEND_URL}/api/agent-token`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Token request failed: ${res.status}`);
+      const data = await res.json();
+      token = data.token;
     } catch (err) {
-      console.warn('[ProfileSetup] Audio creation failed:', err);
-    }
-  }, []);
-
-  // ---- Handle assistant response ----
-
-  const handleAssistantResponse = useCallback(
-    (response: ProfileChatResponse, currentMessages: ChatMessage[]) => {
-      if (!mountedRef.current) return;
-
-      const assistantMsg: ChatMessage = { role: 'assistant', text: response.text };
-      const updatedMessages = [...currentMessages, assistantMsg];
-      setMessages(updatedMessages);
-
-      if (response.audio) {
-        playAudio(response.audio);
-      }
-
-      if (response.done && response.profile) {
-        // Small delay so the user sees Danny's final message before transitioning
-        setTimeout(() => {
-          if (mountedRef.current) {
-            onComplete(response.profile!);
-          }
-        }, 1500);
-      }
-    },
-    [onComplete, playAudio],
-  );
-
-  // ---- Initial greeting on mount ----
-
-  useEffect(() => {
-    mountedRef.current = true;
-
-    if (initCalledRef.current) return;
-    initCalledRef.current = true;
-
-    async function fetchGreeting() {
-      setIsLoading(true);
-      const response = await sendToBackend([]);
-      setIsLoading(false);
-
-      if (response && mountedRef.current) {
-        handleAssistantResponse(response, []);
-      }
-    }
-
-    fetchGreeting();
-
-    return () => {
-      mountedRef.current = false;
-    };
-  }, [sendToBackend, handleAssistantResponse]);
-
-  // ---- Send user message ----
-
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed || isLoading) return;
-
-      setError(null);
-      const userMsg: ChatMessage = { role: 'user', text: trimmed };
-      const updatedMessages = [...messages, userMsg];
-      setMessages(updatedMessages);
-      setInputText('');
-      setIsLoading(true);
-
-      const response = await sendToBackend(updatedMessages);
-      if (!mountedRef.current) return;
-
-      setIsLoading(false);
-
-      if (response) {
-        handleAssistantResponse(response, updatedMessages);
-      }
-
-      // Refocus the input
-      inputRef.current?.focus();
-    },
-    [messages, isLoading, sendToBackend, handleAssistantResponse],
-  );
-
-  // ---- Keyboard submit ----
-
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage(inputText);
-      }
-    },
-    [inputText, sendMessage],
-  );
-
-  // ---- Microphone (webkitSpeechRecognition) ----
-
-  const toggleRecording = useCallback(async () => {
-    if (isRecording) {
-      // Stop recording
-      recognitionRef.current?.stop();
-      setIsRecording(false);
+      setError(`Failed to get token: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
 
-    const SpeechRecognition = (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setError('Speech recognition not supported in this browser.');
-      return;
-    }
-
-    // Chrome extension side panels can't show the mic permission prompt directly.
-    // Check if we already have mic access; if not, open a popup window to request it.
+    // 2. Request mic permission
+    let micStream: MediaStream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((t) => t.stop());
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: SAMPLE_RATE } });
+      micStreamRef.current = micStream;
     } catch {
-      // Permission not granted — open a popup window where Chrome CAN show the prompt.
-      // Once granted for this extension origin, the side panel inherits access.
+      // Try opening permission popup for Chrome extension
       try {
         await chrome.windows.create({
           url: chrome.runtime.getURL('mic-permission.html'),
@@ -223,49 +141,197 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
           height: 300,
           focused: true,
         });
-        setError('Please grant mic access in the popup window, then try again.');
-      } catch (winErr) {
-        console.error('[ProfileSetup] Failed to open mic permission window:', winErr);
-        setError('Could not request mic access. Please enable it in Chrome settings.');
+        setError('Please grant mic access in the popup, then click "Talk to Danny" again.');
+      } catch {
+        setError('Mic access denied. Enable it in Chrome settings.');
       }
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
+    setStatus('Connecting to Danny...');
 
-    recognition.onresult = (event: any) => {
-      const results = event.results;
-      if (results.length > 0) {
-        const transcript = results[results.length - 1][0].transcript;
-        setInputText(transcript);
+    // 3. Set up AudioContext for mic capture + playback
+    const audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    audioCtxRef.current = audioCtx;
 
-        // If the result is final, auto-send
-        if (results[results.length - 1].isFinal) {
-          setIsRecording(false);
-          // Use a small timeout to ensure state is updated
-          setTimeout(() => {
-            sendMessage(transcript);
-          }, 100);
+    // 4. Connect WebSocket to Cartesia voice agent
+    // Browser WebSocket can't set headers, so Cartesia uses ?access_token= for browser clients.
+    const ws = new WebSocket(
+      `wss://api.cartesia.ai/agents/stream/${AGENT_ID}?access_token=${token}&cartesia_version=2025-04-16`,
+    );
+
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      if (!mountedRef.current) return;
+      console.log('[ProfileSetup] WebSocket connected to Cartesia agent');
+      setStatus('Connected! Danny is greeting you...');
+      setIsActive(true);
+
+      // Send start event
+      ws.send(JSON.stringify({
+        event: 'start',
+        config: { input_format: `pcm_${SAMPLE_RATE}` },
+      }));
+    };
+
+    ws.onmessage = (evt) => {
+      if (!mountedRef.current) return;
+      try {
+        const msg = JSON.parse(evt.data);
+
+        if (msg.event === 'ack') {
+          streamIdRef.current = msg.stream_id || '';
+          console.log('[ProfileSetup] Stream ack:', streamIdRef.current);
+
+          // Now start sending mic audio
+          startMicCapture(audioCtx, micStream, ws);
         }
+
+        if (msg.event === 'media_output' && msg.media?.payload) {
+          // Agent audio — decode and schedule for gapless playback
+          const samples = base64PcmToFloat32(msg.media.payload);
+          scheduleAudioChunk(samples);
+        }
+
+        if (msg.event === 'transcript') {
+          // Agent or user transcript
+          const role = msg.role || 'assistant';
+          const text = msg.text || msg.transcript || '';
+          if (text) {
+            setTranscriptLines((prev) => [...prev, { role, text }]);
+            transcriptRef.current += `${role === 'assistant' ? 'Danny' : 'User'}: ${text}\n`;
+
+            // Check for completion phrase
+            if (role === 'assistant' && text.toLowerCase().includes(COMPLETION_PHRASE)) {
+              handleConversationComplete();
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[ProfileSetup] WS message parse error:', err);
       }
     };
 
-    recognition.onerror = (event: any) => {
-      console.error('[ProfileSetup] Speech recognition error:', event.error);
-      setIsRecording(false);
+    ws.onerror = (evt) => {
+      if (!mountedRef.current) return;
+      console.error('[ProfileSetup] WS error:', evt);
+      setError('Connection to voice agent failed. Check console for details.');
+      setIsActive(false);
     };
 
-    recognition.onend = () => {
-      setIsRecording(false);
+    ws.onclose = (evt) => {
+      if (!mountedRef.current) return;
+      console.log('[ProfileSetup] WS closed: code=%d reason=%s wasClean=%s', evt.code, evt.reason, evt.wasClean);
+      if (evt.code !== 1000 && evt.code !== 1005 && !transcriptRef.current) {
+        // Unexpected close before any conversation happened
+        setError(`Voice agent disconnected (code ${evt.code}${evt.reason ? ': ' + evt.reason : ''}). Try again.`);
+      }
+      if (evt.reason === 'call ended by agent') {
+        handleConversationComplete();
+      }
+      setIsActive(false);
+      setIsMicOn(false);
+    };
+  }, [scheduleAudioChunk]);
+
+  // ---- Mic capture via ScriptProcessor (worklet requires module URL) ----
+  function startMicCapture(audioCtx: AudioContext, micStream: MediaStream, ws: WebSocket) {
+    const source = audioCtx.createMediaStreamSource(micStream);
+
+    // Use ScriptProcessor for simplicity (deprecated but works everywhere)
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    processor.onaudioprocess = (e) => {
+      if (ws.readyState !== WebSocket.OPEN || !streamIdRef.current) return;
+      const samples = e.inputBuffer.getChannelData(0);
+      const b64 = float32ToBase64Pcm(samples);
+      ws.send(JSON.stringify({
+        event: 'media_input',
+        stream_id: streamIdRef.current,
+        media: { payload: b64 },
+      }));
     };
 
-    recognitionRef.current = recognition;
-    setIsRecording(true);
-    recognition.start();
-  }, [isRecording, sendMessage]);
+    // ScriptProcessor must be connected to a destination to fire onaudioprocess.
+    // Use a silent GainNode so mic audio doesn't echo through speakers.
+    const silentDest = audioCtx.createGain();
+    silentDest.gain.value = 0;
+    silentDest.connect(audioCtx.destination);
+
+    source.connect(processor);
+    processor.connect(silentDest);
+    setIsMicOn(true);
+  }
+
+  // ---- Extract profile when Danny signals completion ----
+  const handleConversationComplete = useCallback(async () => {
+    setStatus('Extracting your profile...');
+
+    // Close the voice agent connection
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close();
+    }
+    stopMic();
+
+    // Send transcript to our backend for structured extraction
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/extract-profile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: transcriptRef.current }),
+      });
+      if (!res.ok) throw new Error(`Extract failed: ${res.status}`);
+      const data = await res.json();
+
+      if (mountedRef.current && data.profile) {
+        setStatus('Profile ready!');
+        setTimeout(() => {
+          if (mountedRef.current) onComplete(data.profile);
+        }, 1000);
+      }
+    } catch (err) {
+      console.error('[ProfileSetup] Profile extraction failed:', err);
+      setError('Could not extract profile. Using defaults.');
+      setTimeout(() => onSkip(), 1500);
+    }
+  }, [onComplete, onSkip]);
+
+  // ---- Cleanup ----
+  function stopMic() {
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    setIsMicOn(false);
+  }
+
+  function disconnect() {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    stopMic();
+    nextPlayTimeRef.current = 0;
+    setIsActive(false);
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    if (!initCalledRef.current) {
+      initCalledRef.current = true;
+      connect();
+    }
+
+    return () => {
+      mountedRef.current = false;
+      disconnect();
+    };
+  }, [connect]);
 
   // ---- Render ----
 
@@ -293,27 +359,75 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
           Meet Your Commentator
         </h1>
         <p style={{ fontSize: 12, color: '#94a3b8', margin: '4px 0 0' }}>
-          Danny wants to get to know you before the game
+          Have a voice conversation with Danny before the game
         </p>
       </div>
 
-      {/* Message list */}
+      {/* Status bar */}
+      <div style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div
+          style={{
+            width: 8, height: 8, borderRadius: '50%',
+            background: isActive ? (isMicOn ? '#4ade80' : '#facc15') : '#ef4444',
+          }}
+        />
+        <span style={{ fontSize: 12, color: '#94a3b8' }}>{status}</span>
+      </div>
+
+      {/* Conversation visual */}
       <div
         style={{
           flex: 1,
           overflowY: 'auto',
-          padding: '12px 16px',
+          padding: '8px 16px',
           display: 'flex',
           flexDirection: 'column',
-          gap: 10,
+          gap: 8,
         }}
       >
-        {messages.map((msg, i) => (
+        {/* Active voice indicator */}
+        {isActive && (
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '24px 0',
+            }}
+          >
+            <div
+              style={{
+                width: 80, height: 80, borderRadius: '50%',
+                background: isMicOn
+                  ? 'radial-gradient(circle, #7c3aed 0%, #4c1d95 70%)'
+                  : 'radial-gradient(circle, #475569 0%, #1e293b 70%)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                animation: isMicOn ? 'pulse-voice 2s ease-in-out infinite' : 'none',
+                boxShadow: isMicOn ? '0 0 30px rgba(124, 58, 237, 0.4)' : 'none',
+              }}
+            >
+              {/* Mic icon */}
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+                <line x1="8" y1="23" x2="16" y2="23" />
+              </svg>
+            </div>
+            <p style={{ fontSize: 13, color: '#94a3b8', marginTop: 12, textAlign: 'center' }}>
+              {isMicOn ? 'Listening — just talk naturally' : 'Connecting mic...'}
+            </p>
+          </div>
+        )}
+
+        {/* Transcript bubbles */}
+        {transcriptLines.map((line, i) => (
           <div
             key={i}
             style={{
               display: 'flex',
-              justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+              justifyContent: line.role === 'user' ? 'flex-end' : 'flex-start',
             }}
           >
             <div
@@ -323,272 +437,93 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
                 borderRadius: 8,
                 fontSize: 13,
                 lineHeight: 1.5,
-                ...(msg.role === 'assistant'
-                  ? {
-                      background: '#1e293b',
-                      borderLeft: '3px solid #7c3aed',
-                      color: '#e2e8f0',
-                    }
-                  : {
-                      background: '#334155',
-                      color: '#e2e8f0',
-                    }),
+                ...(line.role !== 'user'
+                  ? { background: '#1e293b', borderLeft: '3px solid #7c3aed', color: '#e2e8f0' }
+                  : { background: '#334155', color: '#e2e8f0' }),
               }}
             >
-              {msg.role === 'assistant' && (
-                <div
-                  style={{
-                    fontSize: 9,
-                    fontWeight: 700,
-                    textTransform: 'uppercase',
-                    color: '#7c3aed',
-                    marginBottom: 4,
-                    letterSpacing: '0.05em',
-                  }}
-                >
+              {line.role !== 'user' && (
+                <div style={{
+                  fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+                  color: '#7c3aed', marginBottom: 4, letterSpacing: '0.05em',
+                }}>
                   Danny
                 </div>
               )}
-              {msg.text}
+              {line.text}
             </div>
           </div>
         ))}
 
-        {/* Typing indicator */}
-        {isLoading && (
-          <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
-            <div
-              style={{
-                background: '#1e293b',
-                borderLeft: '3px solid #7c3aed',
-                borderRadius: 8,
-                padding: '10px 14px',
-              }}
-            >
-              <div
-                style={{
-                  fontSize: 9,
-                  fontWeight: 700,
-                  textTransform: 'uppercase',
-                  color: '#7c3aed',
-                  marginBottom: 4,
-                  letterSpacing: '0.05em',
-                }}
-              >
-                Danny
-              </div>
-              <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                <span className="typing-dot" style={{ animationDelay: '0ms' }} />
-                <span className="typing-dot" style={{ animationDelay: '200ms' }} />
-                <span className="typing-dot" style={{ animationDelay: '400ms' }} />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Error message */}
+        {/* Error */}
         {error && (
           <div
             style={{
-              padding: '8px 12px',
-              borderRadius: 6,
+              padding: '8px 12px', borderRadius: 6,
               background: 'rgba(239, 68, 68, 0.15)',
               border: '1px solid rgba(239, 68, 68, 0.3)',
-              color: '#fca5a5',
-              fontSize: 12,
-              textAlign: 'center',
+              color: '#fca5a5', fontSize: 12, textAlign: 'center',
             }}
           >
             {error}
           </div>
         )}
 
-        {/* Invisible scroll anchor */}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input area */}
+      {/* Bottom controls */}
       <div
         style={{
           flexShrink: 0,
           padding: '12px 16px',
           borderTop: '1px solid #1e293b',
+          textAlign: 'center',
         }}
       >
-        <div
+        {!isActive && !error && (
+          <button
+            onClick={() => { initCalledRef.current = false; connect(); }}
+            style={{
+              width: '100%', padding: '10px 16px', borderRadius: 8,
+              border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 14,
+              backgroundColor: '#7c3aed', color: 'white',
+            }}
+          >
+            Talk to Danny
+          </button>
+        )}
+
+        {error && (
+          <button
+            onClick={() => { setError(null); initCalledRef.current = false; connect(); }}
+            style={{
+              width: '100%', padding: '10px 16px', borderRadius: 8,
+              border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 14,
+              backgroundColor: '#7c3aed', color: 'white', marginBottom: 8,
+            }}
+          >
+            Try Again
+          </button>
+        )}
+
+        <button
+          onClick={() => { disconnect(); onSkip(); }}
           style={{
-            display: 'flex',
-            gap: 8,
-            alignItems: 'center',
+            background: 'none', border: 'none', color: '#64748b',
+            fontSize: 12, cursor: 'pointer', padding: '4px 8px',
+            marginTop: isActive ? 0 : 8,
           }}
         >
-          {/* Text input */}
-          <div
-            style={{
-              flex: 1,
-              display: 'flex',
-              alignItems: 'center',
-              background: '#1e293b',
-              border: '1px solid #334155',
-              borderRadius: 8,
-              overflow: 'hidden',
-            }}
-          >
-            <input
-              ref={inputRef}
-              type="text"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={isRecording ? 'Listening...' : 'Type your response...'}
-              disabled={isLoading}
-              style={{
-                flex: 1,
-                padding: '10px 12px',
-                background: 'transparent',
-                border: 'none',
-                outline: 'none',
-                color: '#e2e8f0',
-                fontSize: 13,
-              }}
-            />
-          </div>
-
-          {/* Mic button */}
-          <button
-            onClick={toggleRecording}
-            disabled={isLoading}
-            title={isRecording ? 'Stop recording' : 'Start voice input'}
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: 8,
-              border: 'none',
-              cursor: isLoading ? 'not-allowed' : 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-              background: isRecording ? '#ef4444' : '#475569',
-              transition: 'background 0.2s, transform 0.1s',
-              ...(isRecording ? { animation: 'pulse-mic 1.5s ease-in-out infinite' } : {}),
-            }}
-          >
-            {/* Microphone SVG icon */}
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="19" x2="12" y2="23" />
-              <line x1="8" y1="23" x2="16" y2="23" />
-            </svg>
-          </button>
-
-          {/* Send button */}
-          <button
-            onClick={() => sendMessage(inputText)}
-            disabled={isLoading || !inputText.trim()}
-            title="Send message"
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: 8,
-              border: 'none',
-              cursor: isLoading || !inputText.trim() ? 'not-allowed' : 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-              background:
-                isLoading || !inputText.trim() ? '#334155' : '#7c3aed',
-              transition: 'background 0.2s',
-            }}
-          >
-            {/* Send arrow SVG icon */}
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <line x1="22" y1="2" x2="11" y2="13" />
-              <polygon points="22 2 15 22 11 13 2 9 22 2" />
-            </svg>
-          </button>
-        </div>
-
-        {/* Skip link */}
-        <div style={{ textAlign: 'center', marginTop: 10 }}>
-          <button
-            onClick={onSkip}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: '#64748b',
-              fontSize: 12,
-              cursor: 'pointer',
-              padding: '4px 8px',
-              transition: 'color 0.2s',
-            }}
-            onMouseEnter={(e) => {
-              (e.target as HTMLButtonElement).style.color = '#94a3b8';
-            }}
-            onMouseLeave={(e) => {
-              (e.target as HTMLButtonElement).style.color = '#64748b';
-            }}
-          >
-            Skip setup and use defaults
-          </button>
-        </div>
+          Skip setup and use defaults
+        </button>
       </div>
 
-      {/* Animations */}
       <style>{`
-        .typing-dot {
-          display: inline-block;
-          width: 6px;
-          height: 6px;
-          border-radius: 50%;
-          background: #7c3aed;
-          animation: typing-bounce 1.4s ease-in-out infinite;
+        @keyframes pulse-voice {
+          0%, 100% { transform: scale(1); box-shadow: 0 0 20px rgba(124, 58, 237, 0.3); }
+          50% { transform: scale(1.08); box-shadow: 0 0 40px rgba(124, 58, 237, 0.6); }
         }
-
-        @keyframes typing-bounce {
-          0%, 60%, 100% {
-            transform: translateY(0);
-            opacity: 0.4;
-          }
-          30% {
-            transform: translateY(-6px);
-            opacity: 1;
-          }
-        }
-
-        @keyframes pulse-mic {
-          0%, 100% {
-            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
-          }
-          50% {
-            box-shadow: 0 0 0 8px rgba(239, 68, 68, 0);
-          }
-        }
-
-        input::placeholder {
-          color: #64748b;
-        }
-
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }

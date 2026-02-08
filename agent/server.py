@@ -1,10 +1,12 @@
 """FastAPI server for the AI Sports Commentator.
 
 Endpoints:
-- POST /api/start         — Download a YouTube video and return session info
-- POST /api/profile-chat  — Voice-based profile onboarding conversation
-- WS   /ws/{session_id}   — Stream commentary (text + TTS audio) over WebSocket
-- GET  /api/health         — Health check
+- POST /api/start           — Download a YouTube video and return session info
+- POST /api/profile-chat    — Text-based profile onboarding (legacy)
+- POST /api/agent-token     — Get a Cartesia access token for the voice agent
+- POST /api/extract-profile — Extract structured profile from conversation transcript
+- WS   /ws/{session_id}     — Stream commentary (text + TTS audio) over WebSocket
+- GET  /api/health           — Health check
 """
 
 from __future__ import annotations
@@ -85,6 +87,28 @@ async def startup():
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---- Cartesia Voice Agent Token ----
+
+
+@app.post("/api/agent-token")
+async def agent_token():
+    """Mint a short-lived Cartesia access token for the voice agent WebSocket."""
+    import httpx
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://api.cartesia.ai/access-token",
+            headers={
+                "Content-Type": "application/json",
+                "Cartesia-Version": "2025-04-16",
+                "Authorization": f"Bearer {config.cartesia_api_key}",
+            },
+            json={"grants": {"agent": True}, "expires_in": 300},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 # ---- Profile Onboarding Chat ----
@@ -234,6 +258,67 @@ async def profile_chat(req: ProfileChatRequest):
         done=done,
         profile=profile_dict,
     )
+
+
+# ---- Profile Extraction (for Cartesia Voice Agent flow) ----
+
+_EXTRACT_PROMPT = """\
+Extract a viewer profile from this conversation transcript between a sports \
+commentator (Danny) and a viewer. Return ONLY a JSON object with these fields:
+
+{"name": "string", "favorite_team": "string or null", "experience": "beginner|casual|knowledgeable|expert", "favorite_players": ["string array"], "style": "balanced|moderate|homer"}
+
+If any field wasn't mentioned, use defaults: name="Fan", favorite_team=null, \
+experience="casual", favorite_players=[], style="balanced".
+
+Return ONLY the JSON, no other text.\
+"""
+
+
+class ExtractProfileRequest(BaseModel):
+    transcript: str
+
+
+class ExtractProfileResponse(BaseModel):
+    profile: dict
+
+
+@app.post("/api/extract-profile", response_model=ExtractProfileResponse)
+async def extract_profile(req: ExtractProfileRequest):
+    """Extract a structured UserProfile from a voice conversation transcript."""
+    anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
+    llm_response = await anthropic.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=200,
+        system=_EXTRACT_PROMPT,
+        messages=[{"role": "user", "content": req.transcript}],
+    )
+
+    raw = llm_response.content[0].text.strip()
+
+    # Parse the JSON from Claude's response
+    try:
+        extracted = json_module.loads(raw)
+    except json_module.JSONDecodeError:
+        # Try to find JSON within the response
+        import re as _re
+
+        match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        extracted = json_module.loads(match.group(0)) if match else {}
+
+    experience_key = extracted.get("experience", "casual").lower()
+    style_key = extracted.get("style", "balanced").lower()
+
+    profile_dict = {
+        "name": extracted.get("name", "Fan"),
+        "favorite_team": extracted.get("favorite_team"),
+        "expertise_slider": _EXPERIENCE_TO_EXPERTISE.get(experience_key, 40),
+        "hot_take_slider": _STYLE_TO_HOT_TAKE.get(style_key, 25),
+        "favorite_players": extracted.get("favorite_players", []),
+        "voice_key": "danny",
+    }
+
+    return ExtractProfileResponse(profile=profile_dict)
 
 
 @app.post("/api/start", response_model=StartResponse)
