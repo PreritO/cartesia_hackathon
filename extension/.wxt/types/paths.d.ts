@@ -7,6 +7,8 @@ declare module "wxt/browser" {
     | "/"
     | "/background.js"
     | "/content-scripts/content.js"
+    | "/mic-permission.html"
+    | "/mic-permission.js"
     | "/offscreen.html"
     | "/sidepanel.html"
     | "/youtube-sandbox.html"

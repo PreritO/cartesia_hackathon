@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Microphone Access</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+      text-align: center;
+    }
+    .container { max-width: 300px; }
+    h2 { font-size: 16px; margin-bottom: 8px; }
+    p { font-size: 13px; color: #94a3b8; line-height: 1.5; }
+    #status { margin-top: 16px; font-size: 13px; }
+    .success { color: #4ade80; }
+    .error { color: #f87171; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Microphone Access</h2>
+    <p>Chrome is requesting microphone permission for the AI Sports Commentator extension.</p>
+    <div id="status">Requesting access...</div>
+  </div>
+  <script src="mic-permission.js"></script>
+</body>
+</html>

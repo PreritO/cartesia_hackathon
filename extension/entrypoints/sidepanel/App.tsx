@@ -14,6 +14,7 @@
 
 import { useCallback, useRef, useState } from 'react';
 import { BACKEND_WS_URL, CAPTURE_FPS, JPEG_QUALITY, MAX_CANVAS_WIDTH } from '../../lib/constants';
+import { ProfileSetup, UserProfileData } from './ProfileSetup';
 
 /** Display buffer FPS for smooth delayed playback. */
 const DISPLAY_FPS = 15;
@@ -49,15 +50,9 @@ interface BufferedFrame {
   timestamp: number;
 }
 
-const PERSONA_OPTIONS = [
-  { key: '', label: 'Default (General Audience)' },
-  { key: 'casual_fan', label: 'Casual Fan — Alex' },
-  { key: 'new_to_soccer', label: 'New to Soccer — Jordan' },
-  { key: 'tactical_nerd', label: 'Tactical Nerd — Sam' },
-  { key: 'passionate_homer', label: 'Passionate Homer — Danny' },
-] as const;
-
 export function App() {
+  const [view, setView] = useState<'setup' | 'stream'>('setup');
+  const [userProfile, setUserProfile] = useState<UserProfileData | null>(null);
   const [status, setStatus] = useState('Click "Start Stream" and pick your YouTube tab.');
   const [streaming, setStreaming] = useState(false);
   const [calibrated, setCalibrated] = useState(false);
@@ -65,7 +60,6 @@ export function App() {
   const [detection, setDetection] = useState<DetectionInfo | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [delayedFrameSrc, setDelayedFrameSrc] = useState<string | null>(null);
-  const [persona, setPersona] = useState('');
   const [lockedDelayDisplay, setLockedDelayDisplay] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -251,8 +245,9 @@ export function App() {
       console.log('[AI Commentator] WebSocket connected');
       streamStartRef.current = Date.now();
       setStatus('Calibrating sync — first commentary incoming...');
-      if (persona) {
-        ws.send(JSON.stringify({ type: 'set_persona', persona }));
+      // Send user profile if captured during onboarding
+      if (userProfile) {
+        ws.send(JSON.stringify({ type: 'set_profile', profile: userProfile }));
       }
       // Start capturing frames immediately (they buffer for later)
       startFrameCapture();
@@ -523,6 +518,20 @@ export function App() {
     return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
+  // ---- Profile setup view ----
+  if (view === 'setup') {
+    return (
+      <ProfileSetup
+        onComplete={(profile) => {
+          setUserProfile(profile);
+          setView('stream');
+        }}
+        onSkip={() => setView('stream')}
+      />
+    );
+  }
+
+  // ---- Streaming view ----
   return (
     <div
       style={{
@@ -645,39 +654,27 @@ export function App() {
           </div>
         )}
 
-        {/* Persona selector */}
-        <div style={{ padding: '4px 16px 8px' }}>
-          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>
-            Viewer Persona
-          </label>
-          <select
-            value={persona}
-            onChange={(e) => {
-              const key = e.target.value;
-              setPersona(key);
-              const ws = wsRef.current;
-              if (ws && ws.readyState === WebSocket.OPEN) {
-                if (key) {
-                  ws.send(JSON.stringify({ type: 'set_persona', persona: key }));
-                } else {
-                  ws.send(JSON.stringify({ type: 'set_profile', profile: {} }));
-                }
-              }
-            }}
-            style={{
-              width: '100%',
-              padding: '8px 10px', borderRadius: 6,
-              border: '1px solid #334155',
-              background: '#1e293b', color: '#e2e8f0',
-              fontSize: 13, cursor: 'pointer',
-              appearance: 'auto',
-            }}
-          >
-            {PERSONA_OPTIONS.map((opt) => (
-              <option key={opt.key} value={opt.key}>{opt.label}</option>
-            ))}
-          </select>
-        </div>
+        {/* User profile badge */}
+        {userProfile && (
+          <div style={{ padding: '4px 16px 8px' }}>
+            <div
+              style={{
+                padding: '8px 12px', borderRadius: 6,
+                background: '#1e293b', border: '1px solid #334155',
+                fontSize: 12, color: '#94a3b8',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}
+            >
+              <span style={{ color: '#7c3aed', fontWeight: 700 }}>{userProfile.name}</span>
+              {userProfile.favorite_team && (
+                <span style={{ color: '#64748b' }}>{userProfile.favorite_team}</span>
+              )}
+              <span style={{ marginLeft: 'auto', fontSize: 10, color: '#475569' }}>
+                {userProfile.expertise_slider > 60 ? 'Expert' : userProfile.expertise_slider > 30 ? 'Casual' : 'Beginner'}
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* Controls */}
         <div style={{ padding: '4px 16px 8px' }}>

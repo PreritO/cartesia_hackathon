@@ -1,17 +1,23 @@
 """FastAPI server for the AI Sports Commentator.
 
 Endpoints:
-- POST /api/start   — Download a YouTube video and return session info
-- WS   /ws/{session_id} — Stream commentary (text + TTS audio) over WebSocket
-- GET  /api/health   — Health check
+- POST /api/start         — Download a YouTube video and return session info
+- POST /api/profile-chat  — Voice-based profile onboarding conversation
+- WS   /ws/{session_id}   — Stream commentary (text + TTS audio) over WebSocket
+- GET  /api/health         — Health check
 """
 
 from __future__ import annotations
 
+import base64
+import json as json_module
 import logging
+import re
 import uuid
 from pathlib import Path
 
+from anthropic import AsyncAnthropic
+from cartesia import AsyncCartesia
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -79,6 +85,155 @@ async def startup():
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---- Profile Onboarding Chat ----
+
+_PROFILE_SYSTEM_PROMPT = """\
+You are Danny, the lead play-by-play commentator for our AI sports broadcast. \
+Right now the game hasn't started yet -- you're doing a quick pre-game chat with \
+a new viewer to learn about them so you can personalize the commentary.
+
+Be warm, natural, and brief (1-2 sentences per response). You're a sports buddy, \
+not a form. Weave questions in conversationally -- don't number them or make it \
+feel like an interview checklist.
+
+You need to find out:
+1. The viewer's first name
+2. Their favorite team (if any -- it's okay if they don't have one)
+3. Their experience level with soccer (beginner, casual, knowledgeable, or expert)
+4. Any favorite players they love watching
+5. How they want the commentary style -- balanced/objective, a bit biased toward \
+their team, or full homer mode
+
+After you have gathered enough information (usually 4-5 exchanges), output your \
+final message that wraps up the chat AND include a JSON block in exactly this format \
+at the END of your message:
+
+[PROFILE_COMPLETE]{"name": "...", "favorite_team": "...", "experience": "beginner|casual|knowledgeable|expert", "favorite_players": ["..."], "style": "balanced|moderate|homer"}[/PROFILE_COMPLETE]
+
+If the viewer skips a question or says they don't have a preference, use sensible \
+defaults (no team, casual experience, balanced style, empty players list). \
+Do NOT output the [PROFILE_COMPLETE] block until you have asked enough questions.
+
+Keep it short and fun -- you're excited for the game!\
+"""
+
+_EXPERIENCE_TO_EXPERTISE: dict[str, int] = {
+    "beginner": 15,
+    "casual": 40,
+    "knowledgeable": 65,
+    "expert": 90,
+}
+
+_STYLE_TO_HOT_TAKE: dict[str, int] = {
+    "balanced": 25,
+    "moderate": 50,
+    "homer": 80,
+}
+
+_PROFILE_COMPLETE_RE = re.compile(
+    r"\[PROFILE_COMPLETE\]\s*(\{.*?\})\s*\[/PROFILE_COMPLETE\]",
+    re.DOTALL,
+)
+
+
+class ProfileChatRequest(BaseModel):
+    messages: list[dict]  # [{"role": "user"|"assistant", "text": str}, ...]
+
+
+class ProfileChatResponse(BaseModel):
+    text: str
+    audio: str | None = None
+    done: bool = False
+    profile: dict | None = None
+
+
+@app.post("/api/profile-chat", response_model=ProfileChatResponse)
+async def profile_chat(req: ProfileChatRequest):
+    """Drive a conversational onboarding flow with Danny to build a UserProfile."""
+
+    # Build Anthropic messages from the conversation history.
+    anthropic_messages: list[dict] = []
+    for msg in req.messages:
+        role = msg.get("role", "user")
+        text = msg.get("text", "")
+        if role in ("user", "assistant") and text:
+            anthropic_messages.append({"role": role, "content": text})
+
+    # First call (empty history) — seed with a greeting trigger.
+    if not anthropic_messages:
+        anthropic_messages = [{"role": "user", "content": "Hey! I just tuned in."}]
+
+    # Call Claude to generate Danny's next response.
+    anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
+    llm_response = await anthropic.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=300,
+        system=_PROFILE_SYSTEM_PROMPT,
+        messages=anthropic_messages,
+    )
+
+    raw_text: str = llm_response.content[0].text
+
+    # Check if Danny decided the profile is complete.
+    profile_match = _PROFILE_COMPLETE_RE.search(raw_text)
+    done = profile_match is not None
+    profile_dict: dict | None = None
+
+    # The text the user sees/hears should not contain the raw JSON block.
+    display_text = _PROFILE_COMPLETE_RE.sub("", raw_text).strip()
+
+    if profile_match:
+        try:
+            extracted = json_module.loads(profile_match.group(1))
+        except json_module.JSONDecodeError:
+            extracted = {}
+
+        experience_key = extracted.get("experience", "casual").lower()
+        style_key = extracted.get("style", "balanced").lower()
+
+        profile_dict = {
+            "name": extracted.get("name", "Fan"),
+            "favorite_team": extracted.get("favorite_team"),
+            "expertise_slider": _EXPERIENCE_TO_EXPERTISE.get(experience_key, 40),
+            "hot_take_slider": _STYLE_TO_HOT_TAKE.get(style_key, 25),
+            "favorite_players": extracted.get("favorite_players", []),
+            "voice_key": "danny",
+        }
+
+    # Synthesize Danny's response via Cartesia TTS.
+    audio_b64: str | None = None
+    if display_text and config.cartesia_api_key:
+        try:
+            cartesia = AsyncCartesia(api_key=config.cartesia_api_key)
+            tts_response = cartesia.tts.bytes(
+                model_id="sonic-3",
+                transcript=display_text,
+                voice={"mode": "id", "id": config.voice_id_danny},
+                output_format={
+                    "container": "mp3",
+                    "sample_rate": 44100,
+                    "bit_rate": 128000,
+                },
+                language="en",
+                generation_config={"speed": 1.1},
+            )
+            audio_chunks: list[bytes] = []
+            async for chunk in tts_response:
+                audio_chunks.append(chunk)
+            audio_bytes = b"".join(audio_chunks)
+            audio_b64 = base64.b64encode(audio_bytes).decode()
+            await cartesia.close()
+        except Exception:
+            logger.exception("Cartesia TTS failed during profile chat")
+
+    return ProfileChatResponse(
+        text=display_text,
+        audio=audio_b64,
+        done=done,
+        profile=profile_dict,
+    )
 
 
 @app.post("/api/start", response_model=StartResponse)
