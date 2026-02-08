@@ -138,7 +138,14 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
 
     let micStream: MediaStream;
     try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: SAMPLE_RATE } });
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: SAMPLE_RATE,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       micStreamRef.current = micStream;
     } catch {
       try {

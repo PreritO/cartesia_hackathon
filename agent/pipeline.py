@@ -71,37 +71,37 @@ _INSTRUCTIONS_BY_SPORT: dict[str, dict[str, str]] = {
 
 COMMENTARY_PROMPTS_SOCCER = {
     "danny": [
-        "Call the action you see right now -- what's happening on the pitch?",
-        "Describe this moment like you're painting a picture for the listener.",
-        "What's developing on the field? Give us the play-by-play.",
+        "One punchy line: what's happening right now on the pitch?",
+        "Quick call -- what just happened? One sentence.",
+        "Call the action. Keep it tight, 1-2 sentences max.",
     ],
     "coach_kay": [
-        "Break down what you see tactically -- formations, shape, strategy.",
-        "What's the tactical story here? Why are the teams set up this way?",
-        "Analyze what just happened or what's developing from a coaching perspective.",
+        "One quick tactical observation about what you see.",
+        "Short insight: why is this happening? One sentence.",
+        "Quick coaching take on what just happened.",
     ],
     "rookie": [
-        "React to what's happening like you're watching with a friend. Use any viewer context you have.",
-        "What would you say to the viewer right now? Make it personal and fun.",
-        "Chat about what you see -- bring in any personal connections to the viewer.",
+        "Quick reaction to what's happening -- keep it casual and brief.",
+        "One fun comment about the action. Make it personal if you can.",
+        "Short friendly take on what you see.",
     ],
 }
 
 COMMENTARY_PROMPTS_FOOTBALL = {
     "danny": [
-        "Call the play you see -- formation, snap, what's happening on the field right now.",
-        "Describe this play like you're painting the picture for the audience at home.",
-        "What just happened? Give us the play-by-play -- yards, tackle, result.",
+        "One punchy line: what just happened on that play?",
+        "Quick call -- snap to whistle, what happened? One sentence.",
+        "Call the play. Keep it tight, 1-2 sentences max.",
     ],
     "coach_kay": [
-        "Break down what you see -- offensive formation, defensive alignment, coverage shell.",
-        "What's the tactical story here? Why did they call this play in this situation?",
-        "Analyze what just happened from a coaching perspective -- scheme, execution, adjustments.",
+        "One quick tactical observation about the play or formation.",
+        "Short insight: why did they run that? One sentence.",
+        "Quick coaching take on what just happened.",
     ],
     "rookie": [
-        "React to what's happening like you're watching with a friend. Use any viewer context you have.",
-        "What would you say to the viewer right now? Make it personal and fun.",
-        "Chat about what you see -- bring in any personal connections to the viewer.",
+        "Quick reaction to what's happening -- keep it casual and brief.",
+        "One fun comment about the play. Make it personal if you can.",
+        "Short friendly take on what you see.",
     ],
 }
 
@@ -582,7 +582,11 @@ class BaseCommentaryPipeline:
     # ---- LLM + TTS ----
 
     async def _commentate(
-        self, prompt: str, analyst_key: str = "danny", frame_ts: float | None = None
+        self,
+        prompt: str,
+        analyst_key: str = "danny",
+        frame_ts: float | None = None,
+        force: bool = False,
     ) -> None:
         """Generate commentary via Claude, synthesize via Cartesia, send over WebSocket."""
         analyst = self._analysts.get(analyst_key, self._analysts["danny"])
@@ -592,7 +596,7 @@ class BaseCommentaryPipeline:
         try:
             # Build prompt with recent history so Claude doesn't repeat itself
             full_prompt = prompt
-            if self._recent_commentary:
+            if self._recent_commentary and not force:
                 history = "\n".join(f"- {line}" for line in self._recent_commentary[-3:])
                 full_prompt = (
                     f"{prompt}\n\n"
@@ -667,7 +671,7 @@ class BaseCommentaryPipeline:
 
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=160,
+            max_tokens=80,
             system=self._build_system_prompt(analyst_key=analyst_key),
             messages=[{"role": "user", "content": content}],
         )
@@ -842,14 +846,13 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
             return
 
         analyst_key = "danny"
-        sport_label = "American football game" if self._sport == "football" else "soccer match"
         prompt = (
-            f"The viewer just asked you a question while watching a {sport_label}. "
-            f"Answer it naturally as part of your commentary — keep it brief (1-2 sentences). "
-            f"Use the current frame for context if relevant.\n\n"
-            f"Viewer's question: \"{question}\""
+            f'The viewer just asked: "{question}"\n'
+            f"Answer briefly (1-2 sentences) as part of your commentary, then move on."
         )
-        await self._commentate(prompt, analyst_key=analyst_key, frame_ts=self._last_frame_ts)
+        await self._commentate(
+            prompt, analyst_key=analyst_key, frame_ts=self._last_frame_ts, force=True
+        )
 
     async def process_frame(self, jpeg_bytes: bytes) -> None:
         """Process a JPEG frame: either via RF-DETR or straight to Claude.
@@ -878,7 +881,7 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
                     "American football game" if self._sport == "football" else "soccer match"
                 )
                 await self._commentate(
-                    f"Describe what you see in this {sport_label} frame. {prompt}",
+                    f"You're watching a {sport_label}. {prompt}",
                     analyst_key=analyst_key,
                     frame_ts=snapshot_ts,
                 )
