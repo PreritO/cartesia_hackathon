@@ -730,8 +730,10 @@ export function App() {
                   }}>
                     {entry.emotion}
                   </span>
-                  <span style={{ marginLeft: 'auto', fontSize: 8, color: '#475569', fontFamily: 'monospace' }}>
-                    {fmtTime(entry.capturedAt)} → {fmtTime(entry.displayedAt)}
+                  <span style={{ marginLeft: 'auto', fontSize: 8, color: '#475569', fontFamily: 'monospace' }}
+                    title={`Captured: ${fmtTime(entry.capturedAt)} | Displayed: ${fmtTime(entry.displayedAt)} | Delay: ${lockedDelayDisplay}ms`}
+                  >
+                    {fmtTime(entry.capturedAt)} +{((entry.displayedAt - entry.capturedAt) / 1000).toFixed(1)}s
                   </span>
                 </div>
                 <p style={{ fontSize: 12, margin: '2px 0 0', lineHeight: 1.4, color: '#e2e8f0' }}>

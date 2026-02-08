@@ -67,9 +67,13 @@ async def startup():
     # Mount videos directory for static serving
     app.mount("/videos", StaticFiles(directory=str(videos_dir)), name="videos")
 
-    logger.info("Starting RF-DETR model warmup...")
-    await get_or_load_model()
-    logger.info("RF-DETR model ready. Server is live.")
+    # Skip model warmup when detection is disabled (faster startup)
+    if not config.skip_detection:
+        logger.info("Starting RF-DETR model warmup...")
+        await get_or_load_model()
+        logger.info("RF-DETR model ready. Server is live.")
+    else:
+        logger.info("Detection skipped — frames go straight to Claude. Server is live.")
 
 
 @app.get("/api/health")
@@ -114,7 +118,7 @@ async def live_commentary_ws(ws: WebSocket):
     session_id = str(uuid.uuid4())[:8]
     logger.info("Live WebSocket connected: session %s", session_id)
 
-    pipeline = LiveCommentaryPipeline(ws=ws)
+    pipeline = LiveCommentaryPipeline(ws=ws, skip_detection=config.skip_detection)
     _active_live_pipelines[session_id] = pipeline
 
     try:

@@ -30,6 +30,7 @@ class Config:
     detection_fps: int = 5
     detection_confidence: float = 0.5
     commentary_cooldown: float = 8.0
+    skip_detection: bool = os.getenv("SKIP_DETECTION", "true").lower() == "true"
 
     # Server settings
     server_port: int = int(os.getenv("SERVER_PORT", "8000"))

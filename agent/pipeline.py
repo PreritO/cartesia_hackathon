@@ -472,18 +472,26 @@ class BaseCommentaryPipeline:
 
         # Timer-based: when debouncer allows, commentate regardless of detection
         if self._debouncer:
+            # Snapshot frame_ts NOW before async Claude call
+            snapshot_ts = self._last_frame_ts
             # Pick analyst based on scene and rotation
             analyst_key = self._pick_analyst(self._last_scene)
             self._last_analyst = analyst_key
 
             prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
-            await self._commentate(f"{det_context} {prompt}", analyst_key=analyst_key)
+            await self._commentate(
+                f"{det_context} {prompt}", analyst_key=analyst_key, frame_ts=snapshot_ts
+            )
 
     # ---- LLM + TTS ----
 
-    async def _commentate(self, prompt: str, analyst_key: str = "danny") -> None:
+    async def _commentate(
+        self, prompt: str, analyst_key: str = "danny", frame_ts: float | None = None
+    ) -> None:
         """Generate commentary via Claude, synthesize via Cartesia, send over WebSocket."""
         analyst = ANALYSTS.get(analyst_key, ANALYSTS["danny"])
+        # Snapshot frame_ts NOW (before async calls overwrite _last_frame_ts)
+        captured_frame_ts = frame_ts if frame_ts is not None else self._last_frame_ts
 
         try:
             # Build prompt with recent history so Claude doesn't repeat itself
@@ -527,7 +535,7 @@ class BaseCommentaryPipeline:
                     "analyst": analyst["label"],
                     "audio": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
                     "annotated_frame": self._last_annotated_frame,
-                    "frame_ts": self._last_frame_ts,
+                    "frame_ts": captured_frame_ts,
                 }
             )
 
@@ -743,12 +751,15 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
             self._current_frame_b64 = base64.b64encode(jpeg_bytes).decode()
 
             if self._debouncer:
+                # Snapshot frame_ts NOW before async Claude call
+                snapshot_ts = self._last_frame_ts
                 analyst_key = self._pick_analyst("active_play")
                 self._last_analyst = analyst_key
                 prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
                 await self._commentate(
                     f"Describe what you see in this soccer match frame. {prompt}",
                     analyst_key=analyst_key,
+                    frame_ts=snapshot_ts,
                 )
         else:
             # Full path: RF-DETR detection → enriched commentary
