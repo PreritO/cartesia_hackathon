@@ -1,180 +1,100 @@
 /**
- * Side Panel - Main UI surface for the AI Sports Commentator extension.
+ * Side Panel - Step 1: Control YouTube playback on the active tab.
  *
- * Shows start/stop controls, YouTube player with delayed playback,
- * detection debug overlay, commentary text with emotion colors,
- * and plays TTS audio received from the backend.
+ * Uses chrome.scripting.executeScript to directly control the <video>
+ * element on the YouTube page. No content script needed.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { CommentatorState, ExtensionMessage } from '../../lib/messages';
-import { PIPELINE_DELAY_MS } from '../../lib/constants';
-import { YouTubePlayer } from './YouTubePlayer';
-import { DetectionDebug } from './DetectionDebug';
+import { useEffect, useState } from 'react';
 
-interface CommentaryItem {
-  id: number;
-  text: string;
-  emotion: string;
-  timestamp: number;
-  annotatedFrame?: string | null;
+// Helper: run a function on the active YouTube tab and return the result
+async function runOnTab<T>(tabId: number, func: () => T): Promise<T | null> {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func,
+    });
+    return results?.[0]?.result ?? null;
+  } catch (err) {
+    console.error('[AI Commentator] executeScript error:', err);
+    return null;
+  }
 }
 
-const EMOTION_COLORS: Record<string, string> = {
-  excited: '#facc15',
-  tense: '#f97316',
-  thoughtful: '#60a5fa',
-  celebratory: '#4ade80',
-  disappointed: '#f87171',
-  urgent: '#ef4444',
-  neutral: '#9ca3af',
-};
-
 export function App() {
-  const [state, setState] = useState<CommentatorState>({
-    active: false,
-    status: 'Ready',
-    tabId: null,
-    videoId: null,
-  });
-  const [commentary, setCommentary] = useState<CommentaryItem[]>([]);
-  const [delayMs, setDelayMs] = useState(PIPELINE_DELAY_MS);
-  const [latestFrame, setLatestFrame] = useState<string | null>(null);
-  const nextIdRef = useRef(0);
-  const listRef = useRef<HTMLDivElement>(null);
+  const [tabId, setTabId] = useState<number | null>(null);
+  const [tabTitle, setTabTitle] = useState('');
+  const [status, setStatus] = useState('Looking for YouTube tab...');
+  const [paused, setPaused] = useState(true);
+  const [muted, setMuted] = useState(false);
 
-  // Audio queue for sequential playback
-  const audioQueueRef = useRef<string[]>([]);
-  const isPlayingRef = useRef(false);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-
-  const stopAllAudio = useCallback(() => {
-    audioQueueRef.current = [];
-    isPlayingRef.current = false;
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
+  useEffect(() => {
+    findYouTubeTab();
   }, []);
 
-  const playNextInQueue = useCallback(() => {
-    if (audioQueueRef.current.length === 0) {
-      isPlayingRef.current = false;
-      currentAudioRef.current = null;
-      return;
-    }
-
-    isPlayingRef.current = true;
-    const base64Audio = audioQueueRef.current.shift()!;
-
+  async function findYouTubeTab() {
+    setStatus('Looking for YouTube tab...');
     try {
-      const binaryStr = atob(base64Audio);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        setStatus('No active tab found.');
+        setTabId(null);
+        return;
       }
-      const blob = new Blob([bytes], { type: 'audio/mp3' });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      currentAudioRef.current = audio;
-      audio.volume = 0.8;
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        playNextInQueue();
-      };
-      audio.onerror = () => {
-        URL.revokeObjectURL(url);
-        playNextInQueue();
-      };
-      audio.play().catch(() => {
-        playNextInQueue();
+      if (!tab.url?.includes('youtube.com/watch')) {
+        setStatus('Active tab is not a YouTube video.');
+        setTabId(null);
+        return;
+      }
+
+      // Test that we can execute scripts on this tab
+      const result = await runOnTab(tab.id, () => {
+        const v = document.querySelector('video');
+        if (!v) return null;
+        return { paused: v.paused, muted: v.muted };
       });
-    } catch {
-      console.warn('[AI Commentator] Audio decode error');
-      playNextInQueue();
+
+      if (!result) {
+        setStatus('Could not find video element. Is the video loaded?');
+        setTabId(null);
+        return;
+      }
+
+      setTabId(tab.id);
+      setTabTitle(tab.title?.slice(0, 50) || 'YouTube');
+      setPaused(result.paused);
+      setMuted(result.muted);
+      setStatus('Connected!');
+    } catch (err) {
+      console.error('[AI Commentator]', err);
+      setStatus('Error connecting. Try reloading the YouTube page.');
+      setTabId(null);
     }
-  }, []);
+  }
 
-  const enqueueAudio = useCallback(
-    (base64Audio: string) => {
-      // Cap queue at 5 items to prevent memory buildup
-      if (audioQueueRef.current.length >= 5) {
-        audioQueueRef.current.shift();
-      }
-      audioQueueRef.current.push(base64Audio);
-      if (!isPlayingRef.current) {
-        playNextInQueue();
-      }
-    },
-    [playNextInQueue],
-  );
+  async function handlePlay() {
+    if (!tabId) return;
+    await runOnTab(tabId, () => { document.querySelector('video')?.play(); });
+    setPaused(false);
+  }
 
-  // Load persisted state on mount
-  useEffect(() => {
-    chrome.storage.session.get('commentatorState', (result) => {
-      if (result.commentatorState) {
-        setState(result.commentatorState);
-      }
+  async function handlePause() {
+    if (!tabId) return;
+    await runOnTab(tabId, () => { document.querySelector('video')?.pause(); });
+    setPaused(true);
+  }
+
+  async function handleMuteToggle() {
+    if (!tabId) return;
+    const newMuted = !muted;
+    await runOnTab(tabId, () => {
+      const v = document.querySelector('video');
+      if (v) v.muted = !v.muted;
     });
+    setMuted(newMuted);
+  }
 
-    // Listen for state changes
-    const storageListener = (changes: { [key: string]: chrome.storage.StorageChange }) => {
-      if (changes.commentatorState) {
-        setState(changes.commentatorState.newValue);
-      }
-    };
-    chrome.storage.session.onChanged.addListener(storageListener);
-
-    // Listen for commentary messages from service worker
-    const messageListener = (message: ExtensionMessage) => {
-      if (message.type === 'COMMENTARY') {
-        const item: CommentaryItem = {
-          id: nextIdRef.current++,
-          text: message.text,
-          emotion: message.emotion || 'neutral',
-          timestamp: Date.now(),
-          annotatedFrame: message.annotated_frame,
-        };
-        setCommentary((prev) => [...prev.slice(-19), item]);
-
-        // Update latest annotated frame
-        if (message.annotated_frame) {
-          setLatestFrame(message.annotated_frame);
-        }
-
-        // Queue TTS audio for sequential playback
-        if (message.audio) {
-          enqueueAudio(message.audio);
-        }
-      }
-    };
-    chrome.runtime.onMessage.addListener(messageListener);
-
-    return () => {
-      chrome.storage.session.onChanged.removeListener(storageListener);
-      chrome.runtime.onMessage.removeListener(messageListener);
-    };
-  }, [enqueueAudio]);
-
-  // Auto-scroll to latest commentary
-  useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
-    }
-  }, [commentary]);
-
-  const handleToggle = async () => {
-    if (state.active) {
-      await chrome.runtime.sendMessage({ type: 'STOP_CAPTURE' });
-      setCommentary([]);
-      setLatestFrame(null);
-      stopAllAudio();
-    } else {
-      await chrome.runtime.sendMessage({ type: 'START_CAPTURE' });
-    }
-  };
-
-  const showVideo = state.active && state.videoId;
+  const connected = tabId !== null;
 
   return (
     <div
@@ -193,111 +113,85 @@ export function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
           <div
             style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: state.active ? '#4ade80' : '#6b7280',
+              width: 8, height: 8, borderRadius: '50%',
+              background: connected ? '#4ade80' : '#ef4444',
             }}
           />
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>{state.status}</span>
+          <span style={{ fontSize: 12, color: '#94a3b8' }}>{status}</span>
         </div>
+        {connected && (
+          <p style={{ fontSize: 11, color: '#64748b', margin: '4px 0 0' }}>{tabTitle}</p>
+        )}
       </div>
 
-      {/* YouTube Player */}
-      {showVideo && (
-        <div style={{ padding: '8px 16px' }}>
-          <YouTubePlayer videoId={state.videoId!} delayMs={delayMs} />
-        </div>
-      )}
-
-      {/* Detection Debug */}
-      {state.active && <DetectionDebug annotatedFrame={latestFrame} />}
-
-      {/* Delay Slider */}
-      {showVideo && (
-        <div style={{ padding: '4px 16px 8px', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <label style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap' }}>
-            Delay: {(delayMs / 1000).toFixed(1)}s
-          </label>
-          <input
-            type="range"
-            min={2000}
-            max={10000}
-            step={500}
-            value={delayMs}
-            onChange={(e) => setDelayMs(Number(e.target.value))}
-            style={{ flex: 1, accentColor: '#2563eb' }}
-          />
-        </div>
-      )}
-
       {/* Controls */}
-      <div style={{ padding: '8px 16px' }}>
+      <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
         <button
-          onClick={handleToggle}
+          onClick={findYouTubeTab}
           style={{
-            width: '100%',
-            padding: '10px 16px',
-            borderRadius: 8,
-            border: 'none',
-            cursor: 'pointer',
-            fontWeight: 600,
-            fontSize: 14,
-            backgroundColor: state.active ? '#ef4444' : '#2563eb',
-            color: 'white',
-            transition: 'background-color 0.2s',
+            padding: '8px 16px', borderRadius: 6,
+            border: '1px solid #334155', background: '#1e293b',
+            color: '#94a3b8', fontSize: 13, cursor: 'pointer',
           }}
         >
-          {state.active ? 'Stop Commentary' : 'Start Commentary'}
+          Refresh Connection
+        </button>
+
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button
+            onClick={handlePlay}
+            disabled={!connected}
+            style={{
+              flex: 1, padding: '12px 16px', borderRadius: 8, border: 'none',
+              cursor: connected ? 'pointer' : 'not-allowed',
+              fontWeight: 600, fontSize: 14,
+              backgroundColor: connected ? '#22c55e' : '#1e293b',
+              color: connected ? 'white' : '#475569',
+            }}
+          >
+            Play
+          </button>
+          <button
+            onClick={handlePause}
+            disabled={!connected}
+            style={{
+              flex: 1, padding: '12px 16px', borderRadius: 8, border: 'none',
+              cursor: connected ? 'pointer' : 'not-allowed',
+              fontWeight: 600, fontSize: 14,
+              backgroundColor: connected ? '#ef4444' : '#1e293b',
+              color: connected ? 'white' : '#475569',
+            }}
+          >
+            Pause
+          </button>
+        </div>
+
+        <button
+          onClick={handleMuteToggle}
+          disabled={!connected}
+          style={{
+            padding: '10px 16px', borderRadius: 8, border: 'none',
+            cursor: connected ? 'pointer' : 'not-allowed',
+            fontWeight: 600, fontSize: 14,
+            backgroundColor: connected ? (muted ? '#f97316' : '#2563eb') : '#1e293b',
+            color: connected ? 'white' : '#475569',
+          }}
+        >
+          {muted ? 'Unmute Video' : 'Mute Video'}
         </button>
       </div>
 
-      {/* Commentary list */}
-      <div
-        ref={listRef}
-        style={{
-          flex: 1,
-          overflowY: 'auto',
-          padding: '0 16px 16px',
-        }}
-      >
-        {commentary.length === 0 && !state.active && (
-          <p style={{ fontSize: 13, color: '#64748b', textAlign: 'center', marginTop: 32 }}>
-            Navigate to a sports video and click "Start Commentary" to begin.
+      {!connected && (
+        <div style={{ flex: 1, padding: '0 16px' }}>
+          <p style={{ fontSize: 13, color: '#64748b', textAlign: 'center', marginTop: 16, lineHeight: 1.6 }}>
+            1. Open a YouTube video<br />
+            2. Click "Refresh Connection"<br />
+            3. Use Play / Pause to control it
           </p>
-        )}
-        {commentary.map((item) => (
-          <div
-            key={item.id}
-            style={{
-              background: 'rgba(30, 41, 59, 0.8)',
-              borderLeft: `3px solid ${EMOTION_COLORS[item.emotion] || EMOTION_COLORS.neutral}`,
-              borderRadius: 6,
-              padding: '10px 12px',
-              marginBottom: 8,
-              animation: 'slideIn 0.3s ease-out',
-            }}
-          >
-            <p style={{ fontSize: 13, lineHeight: 1.5, margin: 0 }}>{item.text}</p>
-          </div>
-        ))}
-      </div>
+        </div>
+      )}
 
-      {/* Footer */}
-      <div style={{ padding: '8px 16px', borderTop: '1px solid #1e293b', textAlign: 'center' }}>
-        <span style={{ fontSize: 10, color: '#475569' }}>Backend: localhost:8000</span>
-      </div>
-
-      <style>{`
-        @keyframes slideIn {
-          from { opacity: 0; transform: translateY(4px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        body { margin: 0; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
-      `}</style>
+      <style>{`body { margin: 0; }`}</style>
     </div>
   );
 }

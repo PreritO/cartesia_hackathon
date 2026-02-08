@@ -5,7 +5,7 @@ export default defineConfig({
   manifest: {
     name: 'AI Sports Commentator',
     description: 'Real-time AI-powered sports commentary for any video in your browser',
-    permissions: ['tabCapture', 'offscreen', 'activeTab', 'storage', 'scripting', 'sidePanel'],
+    permissions: ['tabCapture', 'offscreen', 'activeTab', 'tabs', 'storage', 'scripting', 'sidePanel'],
     minimum_chrome_version: '116',
     action: {
       default_title: 'AI Sports Commentator',
@@ -14,8 +14,6 @@ export default defineConfig({
       default_path: 'sidepanel.html',
     },
     content_security_policy: {
-      extension_pages:
-        "script-src 'self'; frame-src 'self'; connect-src 'self' ws://localhost:8000 http://localhost:8000; object-src 'self'",
       sandbox:
         "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' https://www.youtube.com; frame-src https://www.youtube.com; child-src https://www.youtube.com",
     },

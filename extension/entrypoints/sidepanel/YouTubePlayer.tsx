@@ -3,55 +3,82 @@ import { useEffect, useRef, useState } from 'react';
 interface Props {
   videoId: string;
   delayMs: number;
-  onReady?: () => void;
 }
 
 /**
- * Embeds a YouTube video via a sandboxed page.
+ * Embeds a YouTube video via a sandboxed page with a configurable delay.
  *
- * Chrome extensions can't embed YouTube directly from chrome-extension:// origin
- * (Error 153). A sandbox page runs in a unique null origin where embeds work.
- * Communication happens via postMessage.
+ * Chrome extensions can't embed YouTube directly (Error 153).
+ * A sandbox page runs in a unique null origin where YouTube embeds work.
  */
-export function YouTubePlayer({ videoId, delayMs, onReady }: Props) {
-  const [started, setStarted] = useState(false);
+export function YouTubePlayer({ videoId, delayMs }: Props) {
+  const [countdown, setCountdown] = useState(Math.ceil(delayMs / 1000));
+  const [playing, setPlaying] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const iframeLoadedRef = useRef(false);
 
-  // After delay, tell the sandbox to load the video
+  // Send the load message once both conditions are met: iframe loaded + delay elapsed
+  function tryLoad() {
+    if (iframeLoadedRef.current && iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage({ action: 'load', videoId }, '*');
+      setPlaying(true);
+    }
+  }
+
   useEffect(() => {
-    setStarted(false);
+    iframeLoadedRef.current = false;
+    setPlaying(false);
+    setCountdown(Math.ceil(delayMs / 1000));
 
-    timerRef.current = setTimeout(() => {
-      setStarted(true);
-      if (iframeRef.current?.contentWindow) {
-        iframeRef.current.contentWindow.postMessage(
-          { action: 'load', videoId },
-          '*',
-        );
-      }
-      onReady?.();
+    // Countdown display
+    const countdownInterval = setInterval(() => {
+      setCountdown((prev) => (prev > 1 ? prev - 1 : 0));
+    }, 1000);
+
+    // Actual delay timer
+    const delayTimer = setTimeout(() => {
+      clearInterval(countdownInterval);
+      setCountdown(0);
+      tryLoad();
     }, delayMs);
 
     return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      // Clear the sandbox on unmount
+      clearTimeout(delayTimer);
+      clearInterval(countdownInterval);
       if (iframeRef.current?.contentWindow) {
         iframeRef.current.contentWindow.postMessage({ action: 'clear' }, '*');
       }
     };
   }, [videoId, delayMs]);
 
+  const handleIframeLoad = () => {
+    iframeLoadedRef.current = true;
+    // If delay already elapsed, load immediately
+    if (countdown === 0 && !playing) {
+      tryLoad();
+    }
+  };
+
   const sandboxUrl = chrome.runtime.getURL('youtube-sandbox.html');
 
   return (
-    <div style={{ width: '100%', aspectRatio: '16/9', background: '#000', borderRadius: 6, overflow: 'hidden', position: 'relative' }}>
+    <div
+      style={{
+        width: '100%',
+        aspectRatio: '16/9',
+        background: '#000',
+        borderRadius: 6,
+        overflow: 'hidden',
+        position: 'relative',
+      }}
+    >
       <iframe
         ref={iframeRef}
         src={sandboxUrl}
+        onLoad={handleIframeLoad}
         style={{ width: '100%', height: '100%', border: 'none' }}
       />
-      {!started && (
+      {!playing && (
         <div
           style={{
             position: 'absolute',
@@ -60,11 +87,12 @@ export function YouTubePlayer({ videoId, delayMs, onReady }: Props) {
             alignItems: 'center',
             justifyContent: 'center',
             color: '#94a3b8',
-            fontSize: 13,
+            fontSize: 14,
+            fontWeight: 600,
             background: '#000',
           }}
         >
-          Starting in {Math.ceil(delayMs / 1000)}s...
+          {countdown > 0 ? `Starting in ${countdown}s...` : 'Loading...'}
         </div>
       )}
     </div>
