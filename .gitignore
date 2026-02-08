@@ -39,3 +39,4 @@ CLAUDE.md
 videos/
 
 extension/.output/
+*.pth
