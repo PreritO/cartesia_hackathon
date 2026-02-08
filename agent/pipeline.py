@@ -112,6 +112,9 @@ class BaseCommentaryPipeline:
         # Frame counter for debug logging
         self._frame_count = 0
 
+        # Recent commentary history (passed to Claude to avoid repetition)
+        self._recent_commentary: list[str] = []
+
     # ---- Model loading ----
 
     async def _load_model(self) -> None:
@@ -253,36 +256,46 @@ class BaseCommentaryPipeline:
                 await self._commentate(f"{det_context} {prompt}")
         else:
             self._consecutive_no_ball += 1
-            # Even without the ball, still commentate periodically
-            # (the LLM can describe what it sees in the frame)
-            if self._debouncer:
-                if (
-                    self._consecutive_no_ball >= self._no_ball_threshold
-                    and self._ball_was_present
-                ):
-                    logger.info("Ball disappeared for %d frames", self._consecutive_no_ball)
-                    await self._commentate(
-                        f"{det_context} The ball has left the frame — something is developing. "
-                        "Describe what you see happening."
-                    )
-                else:
-                    # No ball but still send frame to Claude for scene description
-                    await self._commentate(
-                        f"{det_context} {random.choice(COMMENTARY_PROMPTS)}"
-                    )
+            # Ball just disappeared — commentate ONCE about it
+            if (
+                self._consecutive_no_ball == self._no_ball_threshold
+                and self._ball_was_present
+                and self._debouncer
+            ):
+                logger.info("Ball disappeared for %d frames — one-time comment", self._consecutive_no_ball)
+                await self._commentate(
+                    f"{det_context} The ball has left the frame. "
+                    "Briefly describe what you see — is this a replay, crowd shot, or camera angle change?"
+                )
+            # Otherwise stay quiet — don't spam during crowd shots / replays
 
     # ---- LLM + TTS ----
 
     async def _commentate(self, prompt: str) -> None:
         """Generate commentary via Claude, synthesize via Cartesia, send over WebSocket."""
         try:
+            # Build prompt with recent history so Claude doesn't repeat itself
+            full_prompt = prompt
+            if self._recent_commentary:
+                history = "\n".join(f"- {line}" for line in self._recent_commentary[-3:])
+                full_prompt = (
+                    f"{prompt}\n\n"
+                    f"You just said (DO NOT repeat these):\n{history}\n"
+                    f"Say something NEW or stay silent if nothing changed."
+                )
+
             # Generate commentary text
-            text = await self._generate_commentary(prompt)
+            text = await self._generate_commentary(full_prompt)
             if not text:
                 return
 
             # Strip emotion tag for display and TTS
             display_text = _EMOTION_RE.sub("", text).strip()
+
+            # Track recent commentary
+            self._recent_commentary.append(display_text)
+            if len(self._recent_commentary) > 5:
+                self._recent_commentary.pop(0)
 
             # Extract emotion for Cartesia
             emotion_match = re.match(r"\[EMOTION:(\w+)\]", text)
