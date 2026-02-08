@@ -39,11 +39,11 @@ _INSTRUCTIONS_PATH = Path(__file__).parent / "instructions" / "commentary.md"
 INSTRUCTIONS = _INSTRUCTIONS_PATH.read_text()
 
 COMMENTARY_PROMPTS = [
-    "Describe the current action on the pitch based on the player positions.",
     "What's happening in the match right now? Call it like you see it.",
-    "Break down the formation and the team's build-up play.",
-    "The ball is in play — give us the play-by-play!",
+    "Provide a play-by-play update based on what you see.",
+    "What is happening on the field right now?",
     "Read the pitch and tell us what's developing.",
+    "Describe the current situation on the field.",
 ]
 
 # Emotion tag pattern for stripping from TTS text
@@ -103,8 +103,14 @@ class BaseCommentaryPipeline:
         # Last annotated frame (base64 JPEG, sent with commentary)
         self._last_annotated_frame: str | None = None
 
+        # Current frame as base64 JPEG for sending to Claude (multimodal)
+        self._current_frame_b64: str | None = None
+
         # Debouncer
         self._debouncer = Debouncer(config.commentary_cooldown)
+
+        # Frame counter for debug logging
+        self._frame_count = 0
 
     # ---- Model loading ----
 
@@ -123,6 +129,7 @@ class BaseCommentaryPipeline:
         if self._model is None:
             return []
 
+        self._frame_count += 1
         loop = asyncio.get_running_loop()
 
         raw_detections: sv.Detections = await loop.run_in_executor(
@@ -133,9 +140,24 @@ class BaseCommentaryPipeline:
         # Annotate frame with all detections (before filtering)
         self._annotate_frame(img, raw_detections)
 
+        # Store current annotated frame as base64 for Claude vision
+        self._current_frame_b64 = self._last_annotated_frame
+
         # Filter to person + sports ball
         detections = self._filter_detections(raw_detections)
-        return self._build_objects(detections)
+        objects = self._build_objects(detections)
+
+        # Debug logging every 25 frames (~5s at 5 FPS)
+        if self._frame_count % 25 == 0:
+            person_count = sum(1 for o in objects if o["label"] == "person")
+            ball_count = sum(1 for o in objects if o["label"] == "sports ball")
+            total_raw = len(raw_detections) if raw_detections else 0
+            logger.info(
+                "Frame %d: %d raw detections → %d persons, %d balls",
+                self._frame_count, total_raw, person_count, ball_count,
+            )
+
+        return objects
 
     def _annotate_frame(self, img: np.ndarray, detections: sv.Detections) -> None:
         """Draw bounding boxes on a copy of the frame and store as base64 JPEG."""
@@ -193,9 +215,23 @@ class BaseCommentaryPipeline:
 
     # ---- Ball tracking + commentary ----
 
+    def _build_detection_context(self, objects: list[DetectedObject]) -> str:
+        """Build a text summary of what was detected for the LLM prompt."""
+        person_count = sum(1 for o in objects if o["label"] == "person")
+        ball_count = sum(1 for o in objects if o["label"] == "sports ball")
+        parts = []
+        if person_count:
+            parts.append(f"{person_count} players detected")
+        if ball_count:
+            parts.append("ball visible")
+        else:
+            parts.append("ball NOT visible in frame")
+        return "Detection: " + ", ".join(parts) + "."
+
     async def _handle_detections(self, objects: list[DetectedObject]) -> None:
         """Ball tracking logic + trigger commentary when appropriate."""
         ball_detected = any(obj["label"] == "sports ball" for obj in objects)
+        det_context = self._build_detection_context(objects)
 
         # Ball reappearance after disappearing = play result
         if ball_detected and self._consecutive_no_ball >= self._no_ball_threshold:
@@ -204,8 +240,8 @@ class BaseCommentaryPipeline:
             if self._debouncer:
                 logger.info("Ball reappeared — triggering play result commentary")
                 await self._commentate(
-                    "The ball just reappeared after being out of frame! "
-                    "Describe what likely happened — a completed pass, a shot on goal, a save, or a clearance."
+                    f"{det_context} The ball just reappeared after being out of frame. "
+                    "Describe what you SEE in the image — what likely just happened?"
                 )
             return
 
@@ -213,20 +249,27 @@ class BaseCommentaryPipeline:
             self._consecutive_no_ball = 0
             self._ball_was_present = True
             if self._debouncer:
-                await self._commentate(random.choice(COMMENTARY_PROMPTS))
+                prompt = random.choice(COMMENTARY_PROMPTS)
+                await self._commentate(f"{det_context} {prompt}")
         else:
             self._consecutive_no_ball += 1
-            if (
-                self._consecutive_no_ball >= self._no_ball_threshold
-                and self._ball_was_present
-                and self._debouncer
-            ):
-                logger.info("Ball disappeared for %d frames", self._consecutive_no_ball)
-                await self._commentate(
-                    "Big play! The ball just disappeared from the camera's view — "
-                    "that means a long pass, a through ball, a shot on goal, or something dramatic "
-                    "is unfolding. Build the excitement!"
-                )
+            # Even without the ball, still commentate periodically
+            # (the LLM can describe what it sees in the frame)
+            if self._debouncer:
+                if (
+                    self._consecutive_no_ball >= self._no_ball_threshold
+                    and self._ball_was_present
+                ):
+                    logger.info("Ball disappeared for %d frames", self._consecutive_no_ball)
+                    await self._commentate(
+                        f"{det_context} The ball has left the frame — something is developing. "
+                        "Describe what you see happening."
+                    )
+                else:
+                    # No ball but still send frame to Claude for scene description
+                    await self._commentate(
+                        f"{det_context} {random.choice(COMMENTARY_PROMPTS)}"
+                    )
 
     # ---- LLM + TTS ----
 
@@ -267,12 +310,29 @@ class BaseCommentaryPipeline:
             logger.exception("Error generating commentary")
 
     async def _generate_commentary(self, prompt: str) -> str:
-        """Call Claude directly to generate commentary."""
+        """Call Claude with the annotated frame (multimodal) + text prompt."""
+        # Build message content: image first (if available), then text
+        content: list[dict[str, Any]] = []
+
+        if self._current_frame_b64:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": self._current_frame_b64,
+                    },
+                }
+            )
+
+        content.append({"type": "text", "text": prompt})
+
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=200,
             system=INSTRUCTIONS,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content}],
         )
         if response.content and response.content[0].type == "text":
             return response.content[0].text

@@ -29,7 +29,7 @@ class Config:
     # Detection settings
     detection_fps: int = 5
     detection_confidence: float = 0.5
-    commentary_cooldown: float = 5.0
+    commentary_cooldown: float = 8.0
 
     # Server settings
     server_port: int = int(os.getenv("SERVER_PORT", "8000"))
