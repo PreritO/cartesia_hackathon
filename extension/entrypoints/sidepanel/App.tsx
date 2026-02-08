@@ -1,17 +1,32 @@
 /**
  * Side Panel — streams the active tab's video via getDisplayMedia(),
- * captures frames at 5 FPS, sends them to the backend over WebSocket,
- * displays a DELAYED video feed (synced with commentary), commentary
- * text + TTS audio, and shows detection debug overlay.
+ * captures frames at 15 FPS (sends to backend at 5 FPS), displays a
+ * DELAYED video feed auto-synced with commentary, and plays TTS audio.
+ *
+ * The delay is dynamic: it auto-calibrates to match the backend's actual
+ * processing time so commentary always arrives in sync with the delayed video.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { BACKEND_WS_URL, CAPTURE_FPS, JPEG_QUALITY, MAX_CANVAS_WIDTH, PIPELINE_DELAY_MS } from '../../lib/constants';
+import { useCallback, useRef, useState } from 'react';
+import { BACKEND_WS_URL, CAPTURE_FPS, JPEG_QUALITY, MAX_CANVAS_WIDTH } from '../../lib/constants';
 
 /** Display buffer runs at higher FPS for smooth delayed playback. */
 const DISPLAY_FPS = 15;
 /** Send to backend every Nth display frame to match CAPTURE_FPS. */
 const BACKEND_SEND_EVERY = Math.max(1, Math.round(DISPLAY_FPS / CAPTURE_FPS));
+
+/** Default delay before we've measured actual processing time. */
+const INITIAL_DELAY_MS = 8000;
+/** Minimum delay (always need some buffer to have frames to show). */
+const MIN_DELAY_MS = 2000;
+/** Maximum delay (don't get absurd). */
+const MAX_DELAY_MS = 25000;
+/** How fast the delay can change: ms of delay adjustment per real second. */
+const DELAY_CONVERGE_SPEED = 1500;
+/** Buffer added on top of measured processing time for safety margin. */
+const DELAY_BUFFER_MS = 500;
+/** Max frame buffer: ~25s at 15 FPS. */
+const MAX_BUFFER_FRAMES = 375;
 
 interface CommentaryEntry {
   text: string;
@@ -43,9 +58,10 @@ export function App() {
   const [commentary, setCommentary] = useState<CommentaryEntry[]>([]);
   const [detection, setDetection] = useState<DetectionInfo | null>(null);
   const [showDebug, setShowDebug] = useState(false);
-  const [delayMs, setDelayMs] = useState(PIPELINE_DELAY_MS);
   const [delayedFrameSrc, setDelayedFrameSrc] = useState<string | null>(null);
   const [persona, setPersona] = useState('');
+  /** Displayed delay for UI indicator (updated periodically from ref). */
+  const [displayDelay, setDisplayDelay] = useState(INITIAL_DELAY_MS);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -55,24 +71,98 @@ export function App() {
   const audioQueueRef = useRef<string[]>([]);
   const playingAudioRef = useRef(false);
   const frameBufferRef = useRef<BufferedFrame[]>([]);
-  const delayMsRef = useRef(delayMs);
   const rafIdRef = useRef<number | null>(null);
   const frameCaptureCountRef = useRef(0);
+  const commentaryTimerIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
 
-  // Keep ref in sync with state
-  useEffect(() => {
-    delayMsRef.current = delayMs;
-  }, [delayMs]);
+  // ---- Dynamic delay auto-sync ----
+  /** The delay currently being applied to the video (smoothly changes). */
+  const currentDelayRef = useRef(INITIAL_DELAY_MS);
+  /** Where we want the delay to converge to (computed from processing times). */
+  const targetDelayRef = useRef(INITIAL_DELAY_MS);
+  /** Recent processing times (ms) for computing target delay. */
+  const processingTimesRef = useRef<number[]>([]);
+  /** Wall-clock time of the last rAF tick (for smooth convergence). */
+  const lastTickTimeRef = useRef(0);
+  /** Counter for throttling React state updates (don't re-render every rAF). */
+  const tickCountRef = useRef(0);
+
+  /**
+   * Called when commentary arrives. Measures actual processing time and
+   * updates the target delay so the video stays in sync.
+   */
+  function updateTargetDelay(frameTs: number) {
+    const processingTime = Date.now() - frameTs;
+    const times = processingTimesRef.current;
+    times.push(processingTime);
+    // Keep a window of last 5 measurements
+    if (times.length > 5) times.shift();
+
+    // Use the max of recent times + buffer to be safe (never too early)
+    const maxRecent = Math.max(...times);
+    const newTarget = Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, maxRecent + DELAY_BUFFER_MS));
+    targetDelayRef.current = newTarget;
+
+    console.log(
+      '[AI Commentator] Processing time: %dms, target delay: %dms (current: %dms)',
+      processingTime, newTarget, Math.round(currentDelayRef.current),
+    );
+  }
+
+  /**
+   * Schedule commentary to display at the right time.
+   * Uses the CURRENT delay (which smoothly tracks the target).
+   */
+  function scheduleCommentary(text: string, emotion: string, audio: string | null, frameTs: number) {
+    const displayAt = frameTs + currentDelayRef.current;
+    const waitMs = Math.max(0, displayAt - Date.now());
+
+    const timerId = setTimeout(() => {
+      setCommentary((prev) => [
+        { text, emotion },
+        ...prev.slice(0, 19),
+      ]);
+      if (audio) {
+        audioQueueRef.current.push(audio);
+        playNextAudio();
+      }
+    }, waitMs);
+
+    commentaryTimerIdsRef.current.push(timerId);
+  }
 
   const startDelayedPlayback = useCallback(() => {
-    // Use requestAnimationFrame for smooth display updates synced to screen refresh
     let lastDisplayedUrl: string | null = null;
+    lastTickTimeRef.current = performance.now();
+    tickCountRef.current = 0;
 
     function tick() {
-      const buffer = frameBufferRef.current;
-      const targetTime = Date.now() - delayMsRef.current;
+      const now = performance.now();
+      const elapsed = now - lastTickTimeRef.current;
+      lastTickTimeRef.current = now;
+      tickCountRef.current++;
 
-      // Find the latest frame older than targetTime
+      // ---- Smoothly converge currentDelay toward targetDelay ----
+      const target = targetDelayRef.current;
+      const current = currentDelayRef.current;
+      const diff = target - current;
+
+      if (Math.abs(diff) > 50) {
+        // Max step this tick: proportional to elapsed time
+        const maxStep = (elapsed / 1000) * DELAY_CONVERGE_SPEED;
+        const step = Math.sign(diff) * Math.min(Math.abs(diff), maxStep);
+        currentDelayRef.current = Math.min(MAX_DELAY_MS, Math.max(MIN_DELAY_MS, current + step));
+      }
+
+      // Update React state for UI display ~2x per second (every 30 ticks at 60fps)
+      if (tickCountRef.current % 30 === 0) {
+        setDisplayDelay(Math.round(currentDelayRef.current));
+      }
+
+      // ---- Pick the right delayed frame to display ----
+      const buffer = frameBufferRef.current;
+      const targetTime = Date.now() - currentDelayRef.current;
+
       let bestIdx = -1;
       for (let i = buffer.length - 1; i >= 0; i--) {
         if (buffer[i].timestamp <= targetTime) {
@@ -85,7 +175,6 @@ export function App() {
         lastDisplayedUrl = buffer[bestIdx].blobUrl;
         setDelayedFrameSrc(lastDisplayedUrl);
 
-        // Revoke and remove all frames before the displayed one
         for (let i = 0; i < bestIdx; i++) {
           URL.revokeObjectURL(buffer[i].blobUrl);
         }
@@ -103,12 +192,19 @@ export function App() {
       cancelAnimationFrame(rafIdRef.current);
       rafIdRef.current = null;
     }
-    // Clean up all buffered frames
     for (const frame of frameBufferRef.current) {
       URL.revokeObjectURL(frame.blobUrl);
     }
     frameBufferRef.current = [];
+    for (const id of commentaryTimerIdsRef.current) {
+      clearTimeout(id);
+    }
+    commentaryTimerIdsRef.current = [];
+    processingTimesRef.current = [];
+    currentDelayRef.current = INITIAL_DELAY_MS;
+    targetDelayRef.current = INITIAL_DELAY_MS;
     setDelayedFrameSrc(null);
+    setDisplayDelay(INITIAL_DELAY_MS);
   }, []);
 
   async function startStream() {
@@ -153,8 +249,7 @@ export function App() {
 
     ws.onopen = () => {
       console.log('[AI Commentator] WebSocket connected');
-      setStatus('Connected! Buffering delayed video...');
-      // Send persona selection before frames start flowing
+      setStatus('Connected! Calibrating sync...');
       if (persona) {
         ws.send(JSON.stringify({ type: 'set_persona', persona }));
       }
@@ -175,14 +270,9 @@ export function App() {
             ballCount: msg.ball_count,
           });
         } else if (msg.type === 'commentary') {
-          console.log('[AI Commentator] Commentary:', msg.text, `[${msg.emotion}]`);
+          const frameTs = msg.frame_ts || 0;
 
-          setCommentary((prev) => [
-            { text: msg.text, emotion: msg.emotion || 'neutral' },
-            ...prev.slice(0, 19),
-          ]);
-          setStatus('Streaming + commenting!');
-
+          // Update detection debug frame immediately
           if (msg.annotated_frame) {
             setDetection((prev) => ({
               annotatedFrame: msg.annotated_frame,
@@ -191,9 +281,25 @@ export function App() {
             }));
           }
 
-          if (msg.audio) {
-            audioQueueRef.current.push(msg.audio);
-            playNextAudio();
+          setStatus('Streaming + commenting!');
+          const emotion = msg.emotion || 'neutral';
+          const audio = msg.audio || null;
+
+          if (frameTs > 0) {
+            // Auto-tune the delay based on actual processing time
+            updateTargetDelay(frameTs);
+            // Schedule commentary to display when delayed video reaches this frame
+            scheduleCommentary(msg.text, emotion, audio, frameTs);
+          } else {
+            // No sync info — display immediately
+            setCommentary((prev) => [
+              { text: msg.text, emotion },
+              ...prev.slice(0, 19),
+            ]);
+            if (audio) {
+              audioQueueRef.current.push(audio);
+              playNextAudio();
+            }
           }
         }
       } catch (err) {
@@ -221,9 +327,6 @@ export function App() {
     if (!ctx) return;
 
     frameCaptureCountRef.current = 0;
-
-    // Run at DISPLAY_FPS (15) for smooth delayed playback.
-    // Send to backend every BACKEND_SEND_EVERY frames (= CAPTURE_FPS rate).
     const intervalMs = 1000 / DISPLAY_FPS;
 
     captureIntervalRef.current = setInterval(() => {
@@ -247,7 +350,7 @@ export function App() {
 
       const now = Date.now();
 
-      // Buffer every frame for smooth delayed playback (lower quality to save memory)
+      // Buffer every frame for smooth delayed playback
       canvas.toBlob(
         (blob) => {
           if (!blob) return;
@@ -255,8 +358,7 @@ export function App() {
             blobUrl: URL.createObjectURL(blob),
             timestamp: now,
           });
-          // Cap buffer: ~20s at 15 FPS = 300 frames
-          while (frameBufferRef.current.length > 300) {
+          while (frameBufferRef.current.length > MAX_BUFFER_FRAMES) {
             const old = frameBufferRef.current.shift();
             if (old) URL.revokeObjectURL(old.blobUrl);
           }
@@ -265,13 +367,14 @@ export function App() {
         0.5,
       );
 
-      // Send to backend at the original CAPTURE_FPS rate (higher quality)
+      // Send to backend at CAPTURE_FPS rate
       const ws = wsRef.current;
       if (
         ws &&
         ws.readyState === WebSocket.OPEN &&
         frameCaptureCountRef.current % BACKEND_SEND_EVERY === 0
       ) {
+        ws.send(JSON.stringify({ type: 'frame_ts', ts: now }));
         canvas.toBlob(
           (blob) => {
             if (blob && ws.readyState === WebSocket.OPEN) {
@@ -359,7 +462,14 @@ export function App() {
     >
       {/* Header — fixed */}
       <div style={{ padding: '10px 16px', borderBottom: '1px solid #1e293b', flexShrink: 0 }}>
-        <h1 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>AI Sports Commentator</h1>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <h1 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>AI Sports Commentator</h1>
+          {streaming && (
+            <span style={{ fontSize: 10, color: '#64748b', fontFamily: 'monospace' }}>
+              sync: {(displayDelay / 1000).toFixed(1)}s
+            </span>
+          )}
+        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
           <div
             style={{
@@ -389,26 +499,14 @@ export function App() {
             }}
           >
             {streaming && delayedFrameSrc ? (
-              <>
-                <img
-                  src={delayedFrameSrc}
-                  style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                  alt="Delayed playback"
-                />
-                <div
-                  style={{
-                    position: 'absolute', top: 6, right: 6,
-                    background: 'rgba(0,0,0,0.7)', borderRadius: 4,
-                    padding: '2px 8px', fontSize: 10, color: '#ef4444',
-                    fontWeight: 600,
-                  }}
-                >
-                  DELAYED {(delayMs / 1000).toFixed(1)}s
-                </div>
-              </>
+              <img
+                src={delayedFrameSrc}
+                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                alt="Delayed playback"
+              />
             ) : (
               <span style={{ color: '#475569', fontSize: 13 }}>
-                {streaming ? 'Buffering...' : 'No video yet'}
+                {streaming ? 'Calibrating sync...' : 'No video yet'}
               </span>
             )}
           </div>
@@ -421,25 +519,6 @@ export function App() {
           playsInline
           muted
         />
-
-        {/* Delay slider */}
-        {streaming && (
-          <div style={{ padding: '4px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 11, color: '#64748b', whiteSpace: 'nowrap' }}>Delay:</span>
-            <input
-              type="range"
-              min={2000}
-              max={12000}
-              step={500}
-              value={delayMs}
-              onChange={(e) => setDelayMs(Number(e.target.value))}
-              style={{ flex: 1, accentColor: '#7c3aed' }}
-            />
-            <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 32, textAlign: 'right' }}>
-              {(delayMs / 1000).toFixed(1)}s
-            </span>
-          </div>
-        )}
 
         {/* Detection debug overlay */}
         {streaming && (
@@ -495,7 +574,6 @@ export function App() {
             onChange={(e) => {
               const key = e.target.value;
               setPersona(key);
-              // Send to backend if already connected
               const ws = wsRef.current;
               if (ws && ws.readyState === WebSocket.OPEN) {
                 if (key) {

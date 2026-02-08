@@ -18,6 +18,9 @@ class UserProfile:
     expertise_slider: int = 50  # 0 = newbie, 100 = film nerd
     hot_take_slider: int = 50  # 0 = neutral, 100 = full homer
 
+    # Voice: "danny", "coach_kay", or "rookie" — maps to VOICE_ID_* env vars
+    voice_key: str = "danny"
+
     # Deep personalization
     alma_mater: str | None = None
     hometown: str | None = None
@@ -92,6 +95,7 @@ class UserProfile:
             rival_team=data.get("rival_team"),
             expertise_slider=data.get("expertise_slider", 50),
             hot_take_slider=data.get("hot_take_slider", 50),
+            voice_key=data.get("voice_key", "danny"),
             alma_mater=data.get("alma_mater"),
             hometown=data.get("hometown"),
             favorite_players=data.get("favorite_players", []),
@@ -107,12 +111,14 @@ PERSONAS: dict[str, UserProfile] = {
         favorite_team="Barcelona",
         expertise_slider=35,
         hot_take_slider=45,
+        voice_key="danny",
         favorite_players=["Lamine Yamal", "Pedri"],
     ),
     "new_to_soccer": UserProfile(
         name="Jordan",
         expertise_slider=10,
         hot_take_slider=20,
+        voice_key="rookie",
         interests=["learning the rules", "understanding positions"],
     ),
     "tactical_nerd": UserProfile(
@@ -121,6 +127,7 @@ PERSONAS: dict[str, UserProfile] = {
         rival_team="Arsenal",
         expertise_slider=95,
         hot_take_slider=30,
+        voice_key="coach_kay",
         favorite_players=["Kevin De Bruyne", "Rodri", "Erling Haaland"],
         interests=["pressing systems", "expected goals", "set piece design"],
     ),
@@ -130,6 +137,7 @@ PERSONAS: dict[str, UserProfile] = {
         rival_team="Manchester United",
         expertise_slider=60,
         hot_take_slider=90,
+        voice_key="danny",
         favorite_players=["Mohamed Salah", "Virgil van Dijk"],
     ),
 }

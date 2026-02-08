@@ -152,6 +152,10 @@ async def live_commentary_ws(ws: WebSocket):
                     else:
                         logger.warning("Unknown persona: %s", persona_key)
 
+                elif msg_type == "frame_ts":
+                    # Capture timestamp from frontend for sync with delayed playback
+                    pipeline._last_frame_ts = data.get("ts", 0.0)
+
                 elif msg_type == "set_profile":
                     # Set a custom profile from JSON
                     profile = UserProfile.from_dict(data.get("profile", {}))

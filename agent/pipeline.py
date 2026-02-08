@@ -119,6 +119,9 @@ class BaseCommentaryPipeline:
         # Debouncer
         self._debouncer = Debouncer(config.commentary_cooldown)
 
+        # Frame capture timestamp from the frontend (for sync with delayed playback)
+        self._last_frame_ts: float = 0.0
+
         # Frame counter for debug logging
         self._frame_count = 0
 
@@ -426,7 +429,7 @@ class BaseCommentaryPipeline:
             # Generate TTS audio
             audio_bytes = await self._synthesize_speech(display_text, emotion)
 
-            # Send both text and audio to frontend
+            # Send both text and audio to frontend (include frame_ts for sync)
             await self.ws.send_json(
                 {
                     "type": "commentary",
@@ -434,6 +437,7 @@ class BaseCommentaryPipeline:
                     "emotion": emotion,
                     "audio": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
                     "annotated_frame": self._last_annotated_frame,
+                    "frame_ts": self._last_frame_ts,
                 }
             )
 
@@ -473,6 +477,16 @@ class BaseCommentaryPipeline:
             return response.content[0].text
         return ""
 
+    def _get_voice_id(self) -> str:
+        """Resolve the Cartesia voice ID from the current profile's voice_key."""
+        voice_map = {
+            "danny": config.voice_id_danny,
+            "coach_kay": config.voice_id_coach_kay,
+            "rookie": config.voice_id_rookie,
+        }
+        voice_id = voice_map.get(self._profile.voice_key, config.voice_id_danny)
+        return voice_id or config.voice_id_danny
+
     async def _synthesize_speech(self, text: str, emotion: str) -> bytes:
         """Generate TTS audio via Cartesia Sonic-3."""
         # Map emotion to speed adjustment
@@ -486,11 +500,12 @@ class BaseCommentaryPipeline:
         }
         speed = speed_map.get(emotion, 1.0)
 
+        voice_id = self._get_voice_id()
         audio_chunks: list[bytes] = []
         response = self._cartesia.tts.bytes(
             model_id="sonic-3",
             transcript=text,
-            voice={"mode": "id", "id": config.voice_id_danny},
+            voice={"mode": "id", "id": voice_id},
             output_format={
                 "container": "mp3",
                 "sample_rate": 44100,
