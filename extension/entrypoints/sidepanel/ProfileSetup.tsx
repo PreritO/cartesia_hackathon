@@ -23,13 +23,24 @@ export interface ProfileSetupProps {
 const BACKEND_URL = 'http://localhost:8000';
 const AGENT_ID = 'agent_DjLxh2mFbRjouYAXQVGpzr';
 const SAMPLE_RATE = 44100;
-const COMPLETION_PHRASE = "i've got the full picture";
+
+const EXPERIENCE_MAP: Record<string, number> = {
+  beginner: 15,
+  casual: 40,
+  knowledgeable: 65,
+  expert: 90,
+};
+
+const STYLE_MAP: Record<string, number> = {
+  balanced: 25,
+  moderate: 50,
+  homer: 80,
+};
 
 // ---------------------------------------------------------------------------
 // Audio helpers
 // ---------------------------------------------------------------------------
 
-/** Convert a Float32Array of PCM samples to 16-bit PCM and base64 encode. */
 function float32ToBase64Pcm(samples: Float32Array): string {
   const buf = new ArrayBuffer(samples.length * 2);
   const view = new DataView(buf);
@@ -45,7 +56,6 @@ function float32ToBase64Pcm(samples: Float32Array): string {
   return btoa(binary);
 }
 
-/** Decode base64 PCM (16-bit signed LE) to Float32Array. */
 function base64PcmToFloat32(b64: string): Float32Array {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
@@ -64,33 +74,35 @@ function base64PcmToFloat32(b64: string): Float32Array {
 // Component
 // ---------------------------------------------------------------------------
 
+type View = 'call' | 'form';
+
 export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
+  // ---- Shared state ----
+  const [view, setView] = useState<View>('call');
+  const [error, setError] = useState<string | null>(null);
+
+  // ---- Call state ----
   const [status, setStatus] = useState('Connecting to Danny...');
   const [isActive, setIsActive] = useState(false);
   const [isMicOn, setIsMicOn] = useState(false);
-  const [transcriptLines, setTranscriptLines] = useState<{ role: string; text: string }[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
+  // ---- Form state (post-call) ----
+  const [formName, setFormName] = useState('');
+  const [formTeam, setFormTeam] = useState('');
+  const [formExperience, setFormExperience] = useState('casual');
+  const [formStyle, setFormStyle] = useState('balanced');
+  const [formPlayers, setFormPlayers] = useState('');
+
+  // ---- Refs ----
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const mountedRef = useRef(true);
   const initCalledRef = useRef(false);
   const streamIdRef = useRef<string>('');
-  const transcriptRef = useRef('');
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  // Gapless audio scheduling: schedule each chunk to start exactly when
-  // the previous one ends, using AudioContext.currentTime for precision.
   const nextPlayTimeRef = useRef(0);
 
-  // ---- Auto-scroll ----
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [transcriptLines]);
-
-  // ---- Schedule agent audio chunk for gapless playback ----
+  // ---- Gapless audio playback ----
   const scheduleAudioChunk = useCallback((samples: Float32Array) => {
     const ctx = audioCtxRef.current;
     if (!ctx || samples.length === 0) return;
@@ -101,8 +113,6 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
     src.buffer = buf;
     src.connect(ctx.destination);
 
-    // Schedule this chunk right after the previous one ends (gapless).
-    // If we've fallen behind (nextPlayTime < now), start immediately.
     const now = ctx.currentTime;
     const startAt = Math.max(now, nextPlayTimeRef.current);
     src.start(startAt);
@@ -114,7 +124,6 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
     setError(null);
     setStatus('Getting access token...');
 
-    // 1. Get access token from our backend
     let token: string;
     try {
       const res = await fetch(`${BACKEND_URL}/api/agent-token`, { method: 'POST' });
@@ -126,20 +135,15 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
       return;
     }
 
-    // 2. Request mic permission
     let micStream: MediaStream;
     try {
       micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: SAMPLE_RATE } });
       micStreamRef.current = micStream;
     } catch {
-      // Try opening permission popup for Chrome extension
       try {
         await chrome.windows.create({
           url: chrome.runtime.getURL('mic-permission.html'),
-          type: 'popup',
-          width: 400,
-          height: 300,
-          focused: true,
+          type: 'popup', width: 400, height: 300, focused: true,
         });
         setError('Please grant mic access in the popup, then click "Talk to Danny" again.');
       } catch {
@@ -150,25 +154,19 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
 
     setStatus('Connecting to Danny...');
 
-    // 3. Set up AudioContext for mic capture + playback
     const audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
     audioCtxRef.current = audioCtx;
 
-    // 4. Connect WebSocket to Cartesia voice agent
-    // Browser WebSocket can't set headers, so Cartesia uses ?access_token= for browser clients.
     const ws = new WebSocket(
       `wss://api.cartesia.ai/agents/stream/${AGENT_ID}?access_token=${token}&cartesia_version=2025-04-16`,
     );
-
     wsRef.current = ws;
 
     ws.onopen = () => {
       if (!mountedRef.current) return;
-      console.log('[ProfileSetup] WebSocket connected to Cartesia agent');
+      console.log('[ProfileSetup] WebSocket connected');
       setStatus('Connected! Danny is greeting you...');
       setIsActive(true);
-
-      // Send start event
       ws.send(JSON.stringify({
         event: 'start',
         config: { input_format: `pcm_${SAMPLE_RATE}` },
@@ -180,67 +178,51 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
       try {
         const msg = JSON.parse(evt.data);
 
+        if (msg.event !== 'media_output') {
+          console.log('[ProfileSetup] Event:', msg.event, msg);
+        }
+
         if (msg.event === 'ack') {
           streamIdRef.current = msg.stream_id || '';
-          console.log('[ProfileSetup] Stream ack:', streamIdRef.current);
-
-          // Now start sending mic audio
           startMicCapture(audioCtx, micStream, ws);
         }
 
         if (msg.event === 'media_output' && msg.media?.payload) {
-          // Agent audio — decode and schedule for gapless playback
           const samples = base64PcmToFloat32(msg.media.payload);
           scheduleAudioChunk(samples);
         }
-
-        if (msg.event === 'transcript') {
-          // Agent or user transcript
-          const role = msg.role || 'assistant';
-          const text = msg.text || msg.transcript || '';
-          if (text) {
-            setTranscriptLines((prev) => [...prev, { role, text }]);
-            transcriptRef.current += `${role === 'assistant' ? 'Danny' : 'User'}: ${text}\n`;
-
-            // Check for completion phrase
-            if (role === 'assistant' && text.toLowerCase().includes(COMPLETION_PHRASE)) {
-              handleConversationComplete();
-            }
-          }
-        }
       } catch (err) {
-        console.error('[ProfileSetup] WS message parse error:', err);
+        console.error('[ProfileSetup] WS parse error:', err);
       }
     };
 
-    ws.onerror = (evt) => {
+    ws.onerror = () => {
       if (!mountedRef.current) return;
-      console.error('[ProfileSetup] WS error:', evt);
-      setError('Connection to voice agent failed. Check console for details.');
+      setError('Connection to voice agent failed.');
       setIsActive(false);
     };
 
     ws.onclose = (evt) => {
       if (!mountedRef.current) return;
-      console.log('[ProfileSetup] WS closed: code=%d reason=%s wasClean=%s', evt.code, evt.reason, evt.wasClean);
-      if (evt.code !== 1000 && evt.code !== 1005 && !transcriptRef.current) {
-        // Unexpected close before any conversation happened
-        setError(`Voice agent disconnected (code ${evt.code}${evt.reason ? ': ' + evt.reason : ''}). Try again.`);
+      console.log('[ProfileSetup] WS closed: code=%d reason=%s', evt.code, evt.reason);
+
+      // Agent ended the call → show profile form
+      if (evt.code === 1000 && (evt.reason === 'call ended by agent' || evt.reason === 'connection cancelled')) {
+        finishCall();
+      } else if (evt.code !== 1000 && evt.code !== 1005) {
+        setError(`Disconnected (code ${evt.code}). Try again.`);
       }
-      if (evt.reason === 'call ended by agent') {
-        handleConversationComplete();
-      }
+
       setIsActive(false);
       setIsMicOn(false);
     };
   }, [scheduleAudioChunk]);
 
-  // ---- Mic capture via ScriptProcessor (worklet requires module URL) ----
+  // ---- Mic capture ----
   function startMicCapture(audioCtx: AudioContext, micStream: MediaStream, ws: WebSocket) {
     const source = audioCtx.createMediaStreamSource(micStream);
-
-    // Use ScriptProcessor for simplicity (deprecated but works everywhere)
     const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
     processor.onaudioprocess = (e) => {
       if (ws.readyState !== WebSocket.OPEN || !streamIdRef.current) return;
       const samples = e.inputBuffer.getChannelData(0);
@@ -252,49 +234,38 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
       }));
     };
 
-    // ScriptProcessor must be connected to a destination to fire onaudioprocess.
-    // Use a silent GainNode so mic audio doesn't echo through speakers.
     const silentDest = audioCtx.createGain();
     silentDest.gain.value = 0;
     silentDest.connect(audioCtx.destination);
-
     source.connect(processor);
     processor.connect(silentDest);
     setIsMicOn(true);
   }
 
-  // ---- Extract profile when Danny signals completion ----
-  const handleConversationComplete = useCallback(async () => {
-    setStatus('Extracting your profile...');
-
-    // Close the voice agent connection
+  // ---- Transition from call → form ----
+  function finishCall() {
+    stopMic();
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.close();
     }
-    stopMic();
+    setView('form');
+    setStatus('Quick confirm — then we\'re live!');
+  }
 
-    // Send transcript to our backend for structured extraction
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/extract-profile`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript: transcriptRef.current }),
-      });
-      if (!res.ok) throw new Error(`Extract failed: ${res.status}`);
-      const data = await res.json();
-
-      if (mountedRef.current && data.profile) {
-        setStatus('Profile ready!');
-        setTimeout(() => {
-          if (mountedRef.current) onComplete(data.profile);
-        }, 1000);
-      }
-    } catch (err) {
-      console.error('[ProfileSetup] Profile extraction failed:', err);
-      setError('Could not extract profile. Using defaults.');
-      setTimeout(() => onSkip(), 1500);
-    }
-  }, [onComplete, onSkip]);
+  // ---- Submit profile form ----
+  function submitProfile() {
+    const profile: UserProfileData = {
+      name: formName.trim() || 'Fan',
+      favorite_team: formTeam.trim() || null,
+      rival_team: null,
+      expertise_slider: EXPERIENCE_MAP[formExperience] ?? 40,
+      hot_take_slider: STYLE_MAP[formStyle] ?? 25,
+      voice_key: 'danny',
+      favorite_players: formPlayers.trim() ? formPlayers.split(',').map((s) => s.trim()) : [],
+      interests: [],
+    };
+    onComplete(profile);
+  }
 
   // ---- Cleanup ----
   function stopMic() {
@@ -310,10 +281,7 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
   }
 
   function disconnect() {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     stopMic();
     nextPlayTimeRef.current = 0;
     setIsActive(false);
@@ -321,166 +289,156 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
 
   useEffect(() => {
     mountedRef.current = true;
-
     if (!initCalledRef.current) {
       initCalledRef.current = true;
       connect();
     }
-
-    return () => {
-      mountedRef.current = false;
-      disconnect();
-    };
+    return () => { mountedRef.current = false; disconnect(); };
   }, [connect]);
 
-  // ---- Render ----
+  // ===========================================================================
+  // Render
+  // ===========================================================================
 
+  const containerStyle = {
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    height: '100vh',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    background: '#0f172a',
+    color: 'white',
+  };
+
+  const headerStyle = {
+    padding: '16px 16px 12px',
+    borderBottom: '1px solid #1e293b',
+    flexShrink: 0,
+    textAlign: 'center' as const,
+  };
+
+  // ---- Form view (after call ends) ----
+  if (view === 'form') {
+    return (
+      <div style={containerStyle}>
+        <div style={headerStyle}>
+          <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Quick Confirm</h1>
+          <p style={{ fontSize: 12, color: '#94a3b8', margin: '4px 0 0' }}>
+            Verify what Danny learned, then let's watch!
+          </p>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <FormField label="Your Name" value={formName} onChange={setFormName} placeholder="e.g. Prerit" />
+          <FormField label="Favorite Team" value={formTeam} onChange={setFormTeam} placeholder="e.g. Arsenal" />
+
+          <div>
+            <label style={labelStyle}>Experience Level</label>
+            <select value={formExperience} onChange={(e) => setFormExperience(e.target.value)} style={selectStyle}>
+              <option value="beginner">Beginner — explain everything</option>
+              <option value="casual">Casual — knows the basics</option>
+              <option value="knowledgeable">Knowledgeable — loves tactics</option>
+              <option value="expert">Expert — deep analysis</option>
+            </select>
+          </div>
+
+          <div>
+            <label style={labelStyle}>Commentary Style</label>
+            <select value={formStyle} onChange={(e) => setFormStyle(e.target.value)} style={selectStyle}>
+              <option value="balanced">Balanced — fair for both sides</option>
+              <option value="moderate">Moderate — slight bias to my team</option>
+              <option value="homer">Homer — full fan mode!</option>
+            </select>
+          </div>
+
+          <FormField label="Favorite Players" value={formPlayers} onChange={setFormPlayers} placeholder="e.g. Saka, Salah" />
+        </div>
+
+        <div style={{ flexShrink: 0, padding: '12px 16px', borderTop: '1px solid #1e293b', textAlign: 'center' }}>
+          <button onClick={submitProfile} style={{
+            width: '100%', padding: '12px 16px', borderRadius: 8,
+            border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 14,
+            backgroundColor: '#4ade80', color: '#0f172a',
+          }}>
+            Let's Watch!
+          </button>
+        </div>
+
+        <style>{scrollbarCss}</style>
+      </div>
+    );
+  }
+
+  // ---- Call view (talking to Danny) ----
   return (
-    <div
-      style={{
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        height: '100vh',
-        display: 'flex',
-        flexDirection: 'column',
-        background: '#0f172a',
-        color: 'white',
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          padding: '16px 16px 12px',
-          borderBottom: '1px solid #1e293b',
-          flexShrink: 0,
-          textAlign: 'center',
-        }}
-      >
-        <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>
-          Meet Your Commentator
-        </h1>
+    <div style={containerStyle}>
+      <div style={headerStyle}>
+        <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Meet Your Commentator</h1>
         <p style={{ fontSize: 12, color: '#94a3b8', margin: '4px 0 0' }}>
           Have a voice conversation with Danny before the game
         </p>
       </div>
 
-      {/* Status bar */}
+      {/* Status */}
       <div style={{ padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <div
-          style={{
-            width: 8, height: 8, borderRadius: '50%',
-            background: isActive ? (isMicOn ? '#4ade80' : '#facc15') : '#ef4444',
-          }}
-        />
+        <div style={{
+          width: 8, height: 8, borderRadius: '50%',
+          background: isActive ? (isMicOn ? '#4ade80' : '#facc15') : '#ef4444',
+        }} />
         <span style={{ fontSize: 12, color: '#94a3b8' }}>{status}</span>
       </div>
 
-      {/* Conversation visual */}
-      <div
-        style={{
-          flex: 1,
-          overflowY: 'auto',
-          padding: '8px 16px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 8,
-        }}
-      >
-        {/* Active voice indicator */}
+      {/* Voice indicator */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '0 16px' }}>
         {isActive && (
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: '24px 0',
-            }}
-          >
-            <div
-              style={{
-                width: 80, height: 80, borderRadius: '50%',
-                background: isMicOn
-                  ? 'radial-gradient(circle, #7c3aed 0%, #4c1d95 70%)'
-                  : 'radial-gradient(circle, #475569 0%, #1e293b 70%)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                animation: isMicOn ? 'pulse-voice 2s ease-in-out infinite' : 'none',
-                boxShadow: isMicOn ? '0 0 30px rgba(124, 58, 237, 0.4)' : 'none',
-              }}
-            >
-              {/* Mic icon */}
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <>
+            <div style={{
+              width: 100, height: 100, borderRadius: '50%',
+              background: isMicOn
+                ? 'radial-gradient(circle, #7c3aed 0%, #4c1d95 70%)'
+                : 'radial-gradient(circle, #475569 0%, #1e293b 70%)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              animation: isMicOn ? 'pulse-voice 2s ease-in-out infinite' : 'none',
+              boxShadow: isMicOn ? '0 0 30px rgba(124, 58, 237, 0.4)' : 'none',
+            }}>
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                 <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                 <line x1="12" y1="19" x2="12" y2="23" />
                 <line x1="8" y1="23" x2="16" y2="23" />
               </svg>
             </div>
-            <p style={{ fontSize: 13, color: '#94a3b8', marginTop: 12, textAlign: 'center' }}>
-              {isMicOn ? 'Listening — just talk naturally' : 'Connecting mic...'}
+            <p style={{ fontSize: 14, color: '#e2e8f0', marginTop: 16, textAlign: 'center', fontWeight: 500 }}>
+              Talking to Danny
             </p>
-          </div>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: 4, textAlign: 'center' }}>
+              Just speak naturally — he'll ask you a few questions
+            </p>
+          </>
         )}
 
-        {/* Transcript bubbles */}
-        {transcriptLines.map((line, i) => (
-          <div
-            key={i}
-            style={{
-              display: 'flex',
-              justifyContent: line.role === 'user' ? 'flex-end' : 'flex-start',
-            }}
-          >
-            <div
-              style={{
-                maxWidth: '85%',
-                padding: '10px 14px',
-                borderRadius: 8,
-                fontSize: 13,
-                lineHeight: 1.5,
-                ...(line.role !== 'user'
-                  ? { background: '#1e293b', borderLeft: '3px solid #7c3aed', color: '#e2e8f0' }
-                  : { background: '#334155', color: '#e2e8f0' }),
-              }}
-            >
-              {line.role !== 'user' && (
-                <div style={{
-                  fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
-                  color: '#7c3aed', marginBottom: 4, letterSpacing: '0.05em',
-                }}>
-                  Danny
-                </div>
-              )}
-              {line.text}
-            </div>
-          </div>
-        ))}
-
-        {/* Error */}
         {error && (
-          <div
-            style={{
-              padding: '8px 12px', borderRadius: 6,
-              background: 'rgba(239, 68, 68, 0.15)',
-              border: '1px solid rgba(239, 68, 68, 0.3)',
-              color: '#fca5a5', fontSize: 12, textAlign: 'center',
-            }}
-          >
+          <div style={{
+            padding: '8px 12px', borderRadius: 6, marginTop: 16,
+            background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.3)',
+            color: '#fca5a5', fontSize: 12, textAlign: 'center',
+          }}>
             {error}
           </div>
         )}
-
-        <div ref={messagesEndRef} />
       </div>
 
-      {/* Bottom controls */}
-      <div
-        style={{
-          flexShrink: 0,
-          padding: '12px 16px',
-          borderTop: '1px solid #1e293b',
-          textAlign: 'center',
-        }}
-      >
+      {/* Controls */}
+      <div style={{ flexShrink: 0, padding: '12px 16px', borderTop: '1px solid #1e293b', textAlign: 'center' }}>
+        {isActive && (
+          <button onClick={finishCall} style={{
+            width: '100%', padding: '12px 16px', borderRadius: 8,
+            border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 14,
+            backgroundColor: '#4ade80', color: '#0f172a', marginBottom: 8,
+          }}>
+            Done — Next Step
+          </button>
+        )}
+
         {!isActive && !error && (
           <button
             onClick={() => { initCalledRef.current = false; connect(); }}
@@ -511,8 +469,7 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
           onClick={() => { disconnect(); onSkip(); }}
           style={{
             background: 'none', border: 'none', color: '#64748b',
-            fontSize: 12, cursor: 'pointer', padding: '4px 8px',
-            marginTop: isActive ? 0 : 8,
+            fontSize: 12, cursor: 'pointer', padding: '4px 8px', marginTop: 4,
           }}
         >
           Skip setup and use defaults
@@ -524,11 +481,64 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
           0%, 100% { transform: scale(1); box-shadow: 0 0 20px rgba(124, 58, 237, 0.3); }
           50% { transform: scale(1.08); box-shadow: 0 0 40px rgba(124, 58, 237, 0.6); }
         }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        ${scrollbarCss}
       `}</style>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shared styles & small components
+// ---------------------------------------------------------------------------
+
+const labelStyle = {
+  fontSize: 11,
+  color: '#94a3b8',
+  display: 'block' as const,
+  marginBottom: 4,
+  textTransform: 'uppercase' as const,
+  letterSpacing: '0.05em',
+  fontWeight: 600,
+};
+
+const inputStyle = {
+  width: '100%',
+  padding: '10px 12px',
+  borderRadius: 6,
+  border: '1px solid #334155',
+  background: '#1e293b',
+  color: '#e2e8f0',
+  fontSize: 13,
+  outline: 'none',
+  boxSizing: 'border-box' as const,
+};
+
+const selectStyle = {
+  ...inputStyle,
+  cursor: 'pointer',
+  appearance: 'auto' as const,
+};
+
+const scrollbarCss = `
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #475569; }
+`;
+
+function FormField({ label, value, onChange, placeholder }: {
+  label: string; value: string; onChange: (v: string) => void; placeholder: string;
+}) {
+  return (
+    <div>
+      <label style={labelStyle}>{label}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={inputStyle}
+      />
     </div>
   );
 }
