@@ -78,11 +78,13 @@ async function startCapture(streamId: string): Promise<void> {
         sendStatus(msg.message);
       } else if (msg.type === 'commentary') {
         // Relay commentary to service worker -> side panel
+        // Backend uses lowercase types; extension uses uppercase internally
         chrome.runtime.sendMessage({
           type: 'COMMENTARY',
           text: msg.text,
           emotion: msg.emotion,
           audio: msg.audio,
+          annotated_frame: msg.annotated_frame ?? null,
         } satisfies ExtensionMessage);
       }
     };

@@ -39,11 +39,11 @@ _INSTRUCTIONS_PATH = Path(__file__).parent / "instructions" / "commentary.md"
 INSTRUCTIONS = _INSTRUCTIONS_PATH.read_text()
 
 COMMENTARY_PROMPTS = [
-    "Describe the current action on the field based on the player positions.",
-    "What's happening in the play right now? Call it like you see it.",
-    "Break down the formation and what the offense is trying to do.",
+    "Describe the current action on the pitch based on the player positions.",
+    "What's happening in the match right now? Call it like you see it.",
+    "Break down the formation and the team's build-up play.",
     "The ball is in play — give us the play-by-play!",
-    "Read the field and tell us what's developing.",
+    "Read the pitch and tell us what's developing.",
 ]
 
 # Emotion tag pattern for stripping from TTS text
@@ -100,6 +100,9 @@ class BaseCommentaryPipeline:
         self._consecutive_no_ball = 0
         self._no_ball_threshold = 3
 
+        # Last annotated frame (base64 JPEG, sent with commentary)
+        self._last_annotated_frame: str | None = None
+
         # Debouncer
         self._debouncer = Debouncer(config.commentary_cooldown)
 
@@ -122,14 +125,37 @@ class BaseCommentaryPipeline:
 
         loop = asyncio.get_running_loop()
 
-        detections: sv.Detections = await loop.run_in_executor(
+        raw_detections: sv.Detections = await loop.run_in_executor(
             _executor,
             lambda: self._model.predict(img, threshold=config.detection_confidence),
         )
 
+        # Annotate frame with all detections (before filtering)
+        self._annotate_frame(img, raw_detections)
+
         # Filter to person + sports ball
-        detections = self._filter_detections(detections)
+        detections = self._filter_detections(raw_detections)
         return self._build_objects(detections)
+
+    def _annotate_frame(self, img: np.ndarray, detections: sv.Detections) -> None:
+        """Draw bounding boxes on a copy of the frame and store as base64 JPEG."""
+        try:
+            annotated = img.copy()
+            labels = []
+            if detections.class_id is not None:
+                for cid in detections.class_id:
+                    labels.append(self._class_name_map.get(int(cid), f"class_{cid}"))
+
+            annotated = self._box_annotator.annotate(annotated, detections)
+            if labels:
+                annotated = self._label_annotator.annotate(annotated, detections, labels=labels)
+
+            pil_img = Image.fromarray(annotated)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=50)
+            self._last_annotated_frame = base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            logger.exception("Error annotating frame")
 
     def _filter_detections(self, detections: sv.Detections) -> sv.Detections:
         """Keep only person and sports ball."""
@@ -179,7 +205,7 @@ class BaseCommentaryPipeline:
                 logger.info("Ball reappeared — triggering play result commentary")
                 await self._commentate(
                     "The ball just reappeared after being out of frame! "
-                    "Describe what likely happened — a completed pass, a big run, or a turnover."
+                    "Describe what likely happened — a completed pass, a shot on goal, a save, or a clearance."
                 )
             return
 
@@ -198,7 +224,7 @@ class BaseCommentaryPipeline:
                 logger.info("Ball disappeared for %d frames", self._consecutive_no_ball)
                 await self._commentate(
                     "Big play! The ball just disappeared from the camera's view — "
-                    "that means a long pass, a breakaway run, or something dramatic "
+                    "that means a long pass, a through ball, a shot on goal, or something dramatic "
                     "is unfolding. Build the excitement!"
                 )
 
@@ -229,6 +255,7 @@ class BaseCommentaryPipeline:
                     "text": display_text,
                     "emotion": emotion,
                     "audio": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
+                    "annotated_frame": self._last_annotated_frame,
                 }
             )
 
@@ -292,8 +319,9 @@ class BaseCommentaryPipeline:
             self._running = False
 
     async def stop(self) -> None:
-        """Signal the pipeline to stop."""
+        """Signal the pipeline to stop and clean up resources."""
         self._running = False
+        await self._cartesia.close()
 
 
 class CommentaryPipeline(BaseCommentaryPipeline):

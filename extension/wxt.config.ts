@@ -13,5 +13,9 @@ export default defineConfig({
     side_panel: {
       default_path: 'sidepanel.html',
     },
+    content_security_policy: {
+      extension_pages:
+        "script-src 'self' https://www.youtube.com; frame-src https://www.youtube.com; object-src 'self'",
+    },
   },
 });

@@ -16,11 +16,13 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "wxt": "^0.20.0",
-    "@wxt-dev/module-react": "^1.0.0",
-    "typescript": "~5.9.3",
+    "@anthropic-ai/claude-code": "^2.1.37",
+    "@types/chrome": "^0.0.300",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
-    "@types/chrome": "^0.0.300"
+    "@types/youtube": "^0.1.2",
+    "@wxt-dev/module-react": "^1.0.0",
+    "typescript": "~5.9.3",
+    "wxt": "^0.20.0"
   }
 }

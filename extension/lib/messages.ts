@@ -17,6 +17,7 @@ export interface CommentaryMessage {
   text: string;
   emotion: string;
   audio: string | null;
+  annotated_frame?: string | null;
 }
 
 export interface StatusMessage {
@@ -33,6 +34,15 @@ export interface CommentatorState {
   active: boolean;
   status: string;
   tabId: number | null;
+  videoId: string | null;
+}
+
+export interface MuteTabVideoMessage {
+  type: 'MUTE_TAB_VIDEO';
+}
+
+export interface UnmuteTabVideoMessage {
+  type: 'UNMUTE_TAB_VIDEO';
 }
 
 export type ExtensionMessage =
@@ -41,4 +51,6 @@ export type ExtensionMessage =
   | CaptureStartedMessage
   | CommentaryMessage
   | StatusMessage
-  | StateUpdateMessage;
+  | StateUpdateMessage
+  | MuteTabVideoMessage
+  | UnmuteTabVideoMessage;
