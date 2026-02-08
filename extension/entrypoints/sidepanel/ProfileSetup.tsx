@@ -92,6 +92,7 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
   const [formExperience, setFormExperience] = useState('casual');
   const [formStyle, setFormStyle] = useState('balanced');
   const [formPlayers, setFormPlayers] = useState('');
+  const [extracting, setExtracting] = useState(false);
 
   // ---- Refs ----
   const wsRef = useRef<WebSocket | null>(null);
@@ -243,13 +244,39 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
   }
 
   // ---- Transition from call → form ----
-  function finishCall() {
+  async function finishCall() {
     stopMic();
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.close();
     }
     setView('form');
-    setStatus('Quick confirm — then we\'re live!');
+    setExtracting(true);
+
+    // Fetch transcript + extract profile from Cartesia call
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/call-transcript`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: AGENT_ID }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const p = data.profile;
+        console.log('[ProfileSetup] Profile extracted from transcript:', p);
+        if (p) {
+          setFormName(p.name || '');
+          setFormTeam(p.favorite_team || '');
+          if (p.experience) setFormExperience(p.experience);
+          if (p.style) setFormStyle(p.style);
+          if (p.favorite_players?.length) setFormPlayers(p.favorite_players.join(', '));
+        }
+      } else {
+        console.warn('[ProfileSetup] Failed to fetch transcript:', res.status);
+      }
+    } catch (err) {
+      console.warn('[ProfileSetup] Error fetching transcript:', err);
+    }
+    setExtracting(false);
   }
 
   // ---- Submit profile form ----
@@ -323,7 +350,7 @@ export function ProfileSetup({ onComplete, onSkip }: ProfileSetupProps) {
         <div style={headerStyle}>
           <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Quick Confirm</h1>
           <p style={{ fontSize: 12, color: '#94a3b8', margin: '4px 0 0' }}>
-            Verify what Danny learned, then let's watch!
+            {extracting ? 'Extracting what Danny learned...' : 'Verify what Danny learned, then let\'s watch!'}
           </p>
         </div>
 

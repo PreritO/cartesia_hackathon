@@ -5,6 +5,7 @@ Endpoints:
 - POST /api/profile-chat    — Text-based profile onboarding (legacy)
 - POST /api/agent-token     — Get a Cartesia access token for the voice agent
 - POST /api/extract-profile — Extract structured profile from conversation transcript
+- POST /api/call-transcript    — Fetch latest Cartesia call transcript + extract profile
 - WS   /ws/{session_id}     — Stream commentary (text + TTS audio) over WebSocket
 - GET  /api/health           — Health check
 """
@@ -319,6 +320,107 @@ async def extract_profile(req: ExtractProfileRequest):
     }
 
     return ExtractProfileResponse(profile=profile_dict)
+
+
+# ---- Cartesia Call Transcript (for post-call profile extraction) ----
+
+
+class CallTranscriptResponse(BaseModel):
+    transcript: str
+    profile: dict
+
+
+class CallTranscriptRequest(BaseModel):
+    agent_id: str
+
+
+@app.post("/api/call-transcript", response_model=CallTranscriptResponse)
+async def call_transcript(req: CallTranscriptRequest):
+    """Fetch transcript from the most recent Cartesia voice agent call and extract profile."""
+    import httpx
+
+    # 1. List recent calls for this agent (most recent first) with transcript expanded
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.cartesia.ai/agents/calls",
+            headers={
+                "Cartesia-Version": "2025-04-16",
+                "Authorization": f"Bearer {config.cartesia_api_key}",
+            },
+            params={
+                "agent_id": req.agent_id,
+                "expand": "transcript",
+                "limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+    calls = result.get("data", [])
+    if not calls:
+        return CallTranscriptResponse(
+            transcript="",
+            profile={
+                "name": "Fan",
+                "favorite_team": None,
+                "expertise_slider": 40,
+                "hot_take_slider": 25,
+                "favorite_players": [],
+                "voice_key": "danny",
+            },
+        )
+
+    call_data = calls[0]
+
+    # 2. Build a readable transcript string from the call data
+    transcript_parts: list[str] = []
+    for turn in call_data.get("transcript", []):
+        role = turn.get("role", "unknown")
+        text = turn.get("text", "")
+        speaker = "Danny" if role == "assistant" else "Viewer"
+        transcript_parts.append(f"{speaker}: {text}")
+
+    transcript_text = "\n".join(transcript_parts)
+    logger.info(
+        "Fetched transcript for call %s: %d turns",
+        call_data.get("id", "?"),
+        len(transcript_parts),
+    )
+    logger.info("Transcript text:\n%s", transcript_text)
+
+    # 3. Extract structured profile via Claude
+    anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
+    llm_response = await anthropic.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=200,
+        system=_EXTRACT_PROMPT,
+        messages=[{"role": "user", "content": transcript_text}],
+    )
+
+    raw = llm_response.content[0].text.strip()
+
+    try:
+        extracted = json_module.loads(raw)
+    except json_module.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        extracted = json_module.loads(match.group(0)) if match else {}
+
+    experience_key = extracted.get("experience", "casual").lower()
+    style_key = extracted.get("style", "balanced").lower()
+
+    profile_dict = {
+        "name": extracted.get("name", "Fan"),
+        "favorite_team": extracted.get("favorite_team"),
+        "experience": experience_key,
+        "style": style_key,
+        "expertise_slider": _EXPERIENCE_TO_EXPERTISE.get(experience_key, 40),
+        "hot_take_slider": _STYLE_TO_HOT_TAKE.get(style_key, 25),
+        "favorite_players": extracted.get("favorite_players", []),
+        "voice_key": "danny",
+    }
+    logger.info("Extracted profile: %s", profile_dict)
+
+    return CallTranscriptResponse(transcript=transcript_text, profile=profile_dict)
 
 
 @app.post("/api/start", response_model=StartResponse)
