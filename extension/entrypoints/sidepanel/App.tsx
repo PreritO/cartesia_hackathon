@@ -32,6 +32,10 @@ interface CommentaryEntry {
   text: string;
   emotion: string;
   analyst: string;
+  /** When the frame was captured (ms since epoch). */
+  capturedAt: number;
+  /** When commentary was displayed to the user (ms since epoch). */
+  displayedAt: number;
 }
 
 interface DetectionInfo {
@@ -76,6 +80,8 @@ export function App() {
   const rafIdRef = useRef<number | null>(null);
   const frameCaptureCountRef = useRef(0);
   const commentaryTimerIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  /** When streaming started (for relative timestamps). */
+  const streamStartRef = useRef(0);
 
   // ---- Calibration state ----
   /** Whether we've locked the delay (set once, never changes). */
@@ -131,7 +137,7 @@ export function App() {
 
     const timerId = setTimeout(() => {
       setCommentary((prev) => [
-        { text, emotion, analyst },
+        { text, emotion, analyst, capturedAt: frameTs, displayedAt: Date.now() },
         ...prev.slice(0, 19),
       ]);
       if (audio) {
@@ -243,6 +249,7 @@ export function App() {
 
     ws.onopen = () => {
       console.log('[AI Commentator] WebSocket connected');
+      streamStartRef.current = Date.now();
       setStatus('Calibrating sync — first commentary incoming...');
       if (persona) {
         ws.send(JSON.stringify({ type: 'set_persona', persona }));
@@ -288,7 +295,7 @@ export function App() {
             if (!locked) {
               // Pre-calibration: show commentary immediately (no sync yet)
               setCommentary((prev) => [
-                { text: msg.text, emotion, analyst },
+                { text: msg.text, emotion, analyst, capturedAt: frameTs || Date.now(), displayedAt: Date.now() },
                 ...prev.slice(0, 19),
               ]);
               if (audio) {
@@ -307,7 +314,7 @@ export function App() {
           } else if (frameTs === 0) {
             // No sync info — display immediately
             setCommentary((prev) => [
-              { text: msg.text, emotion, analyst },
+              { text: msg.text, emotion, analyst, capturedAt: frameTs || Date.now(), displayedAt: Date.now() },
               ...prev.slice(0, 19),
             ]);
             if (audio) {
@@ -507,6 +514,14 @@ export function App() {
     'Coach Kay': '#0ea5e9',
     Rookie: '#f97316',
   };
+
+  /** Format ms-since-epoch to mm:ss relative to stream start. */
+  function fmtTime(ms: number): string {
+    const elapsed = Math.max(0, Math.round((ms - streamStartRef.current) / 1000));
+    const m = Math.floor(elapsed / 60);
+    const s = elapsed % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
 
   return (
     <div
@@ -714,6 +729,9 @@ export function App() {
                     textTransform: 'uppercase', opacity: 0.8,
                   }}>
                     {entry.emotion}
+                  </span>
+                  <span style={{ marginLeft: 'auto', fontSize: 8, color: '#475569', fontFamily: 'monospace' }}>
+                    {fmtTime(entry.capturedAt)} → {fmtTime(entry.displayedAt)}
                   </span>
                 </div>
                 <p style={{ fontSize: 12, margin: '2px 0 0', lineHeight: 1.4, color: '#e2e8f0' }}>

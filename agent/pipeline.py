@@ -563,7 +563,7 @@ class BaseCommentaryPipeline:
 
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=120,
+            max_tokens=160,
             system=self._build_system_prompt(analyst_key=analyst_key),
             messages=[{"role": "user", "content": content}],
         )
@@ -593,12 +593,12 @@ class BaseCommentaryPipeline:
         """Generate TTS audio via Cartesia Sonic-3."""
         # Map emotion to speed adjustment
         speed_map = {
-            "excited": 1.5,
-            "tense": 1.4,
-            "thoughtful": 1.3,
-            "celebratory": 1.5,
-            "disappointed": 1.2,
-            "urgent": 1.4,
+            "excited": 1.2,
+            "tense": 1.1,
+            "thoughtful": 1.1,
+            "celebratory": 1.3,
+            "disappointed": 1.0,
+            "urgent": 1.2,
         }
         speed = speed_map.get(emotion, 1.3)
 
@@ -711,16 +711,25 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
         profile: Optional user profile for personalized commentary.
     """
 
-    def __init__(self, ws: WebSocket, profile: UserProfile | None = None) -> None:
+    def __init__(
+        self,
+        ws: WebSocket,
+        profile: UserProfile | None = None,
+        skip_detection: bool = True,
+    ) -> None:
         super().__init__(ws, profile=profile)
+        self._skip_detection = skip_detection
 
     async def initialize(self) -> None:
-        """Load the RF-DETR model and notify the client."""
+        """Load model (if detection enabled) and notify the client."""
         self._running = True
-        await self._load_model()
+        if self._skip_detection:
+            await self._send_status("Ready — sending frames directly to Claude.")
+        else:
+            await self._load_model()
 
     async def process_frame(self, jpeg_bytes: bytes) -> None:
-        """Decode a JPEG frame, run detection, and handle events.
+        """Process a JPEG frame: either via RF-DETR or straight to Claude.
 
         Args:
             jpeg_bytes: Raw JPEG image bytes (e.g. from a webcam capture).
@@ -728,11 +737,25 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
         if not self._running:
             return
 
-        img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-        frame_array = np.array(img)
+        if self._skip_detection:
+            # Fast path: skip RF-DETR, just store the frame for Claude and commentate
+            self._frame_count += 1
+            self._current_frame_b64 = base64.b64encode(jpeg_bytes).decode()
 
-        objects = await self._detect_from_array(frame_array)
-        await self._handle_detections(objects)
+            if self._debouncer:
+                analyst_key = self._pick_analyst("active_play")
+                self._last_analyst = analyst_key
+                prompt = random.choice(COMMENTARY_PROMPTS[analyst_key])
+                await self._commentate(
+                    f"Describe what you see in this soccer match frame. {prompt}",
+                    analyst_key=analyst_key,
+                )
+        else:
+            # Full path: RF-DETR detection → enriched commentary
+            img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+            frame_array = np.array(img)
+            objects = await self._detect_from_array(frame_array)
+            await self._handle_detections(objects)
 
 
 # ---- Shared model cache ----
