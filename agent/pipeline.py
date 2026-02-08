@@ -352,44 +352,26 @@ class BaseCommentaryPipeline:
         return " ".join(parts)
 
     async def _handle_detections(self, objects: list[DetectedObject]) -> None:
-        """Ball tracking logic + trigger commentary when appropriate."""
+        """Timer-based commentary: every debounce interval, send frame + context to Claude.
+
+        RF-DETR enriches the prompt but does NOT gate whether commentary happens.
+        Claude sees the frame and decides what's worth saying.
+        """
+        # Update ball tracking state (for trajectory enrichment only)
         ball_detected = any(obj["label"] == "sports ball" for obj in objects)
-        det_context = self._build_detection_context(objects)
-
-        # Ball reappearance after disappearing = play result
-        if ball_detected and self._consecutive_no_ball >= self._no_ball_threshold:
-            self._consecutive_no_ball = 0
-            self._ball_was_present = True
-            if self._debouncer:
-                logger.info("Ball reappeared — triggering play result commentary")
-                await self._commentate(
-                    f"{det_context} The ball just reappeared after being out of frame. "
-                    "Describe what you SEE in the image — what likely just happened?"
-                )
-            return
-
         if ball_detected:
             self._consecutive_no_ball = 0
             self._ball_was_present = True
-            if self._debouncer:
-                prompt = random.choice(COMMENTARY_PROMPTS)
-                await self._commentate(f"{det_context} {prompt}")
         else:
             self._consecutive_no_ball += 1
-            # Ball just disappeared — commentate ONCE about it
-            if (
-                self._consecutive_no_ball == self._no_ball_threshold
-                and self._ball_was_present
-                and self._debouncer
-            ):
-                logger.info(
-                    "Ball disappeared for %d frames — one-time comment", self._consecutive_no_ball
-                )
-                await self._commentate(
-                    f"{det_context} The ball has left the frame. "
-                    "Briefly describe what you see — is this a replay, crowd shot, or camera angle change?"
-                )
-            # Otherwise stay quiet — don't spam during crowd shots / replays
+
+        # Build detection context (always, for enrichment)
+        det_context = self._build_detection_context(objects)
+
+        # Timer-based: when debouncer allows, commentate regardless of detection
+        if self._debouncer:
+            prompt = random.choice(COMMENTARY_PROMPTS)
+            await self._commentate(f"{det_context} {prompt}")
 
     # ---- LLM + TTS ----
 
