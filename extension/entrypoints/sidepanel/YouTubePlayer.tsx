@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface Props {
   videoId: string;
@@ -6,118 +6,67 @@ interface Props {
   onReady?: () => void;
 }
 
-declare global {
-  interface Window {
-    YT: typeof YT;
-    onYouTubeIframeAPIReady: (() => void) | undefined;
-  }
-}
-
-let apiLoaded = false;
-let apiLoading = false;
-const apiReadyCallbacks: (() => void)[] = [];
-
-function loadYouTubeAPI(): Promise<void> {
-  if (apiLoaded) return Promise.resolve();
-  return new Promise((resolve) => {
-    if (apiLoading) {
-      apiReadyCallbacks.push(resolve);
-      return;
-    }
-    apiLoading = true;
-    apiReadyCallbacks.push(resolve);
-
-    const prev = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      apiLoaded = true;
-      apiLoading = false;
-      prev?.();
-      for (const cb of apiReadyCallbacks) cb();
-      apiReadyCallbacks.length = 0;
-    };
-
-    const script = document.createElement('script');
-    script.src = 'https://www.youtube.com/iframe_api';
-    document.head.appendChild(script);
-  });
-}
-
+/**
+ * Embeds a YouTube video via a sandboxed page.
+ *
+ * Chrome extensions can't embed YouTube directly from chrome-extension:// origin
+ * (Error 153). A sandbox page runs in a unique null origin where embeds work.
+ * Communication happens via postMessage.
+ */
 export function YouTubePlayer({ videoId, delayMs, onReady }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const playerRef = useRef<YT.Player | null>(null);
-  const delayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const initializedRef = useRef(false);
+  const [started, setStarted] = useState(false);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Use refs to always access latest props without stale closures
-  const delayMsRef = useRef(delayMs);
-  delayMsRef.current = delayMs;
-  const onReadyRef = useRef(onReady);
-  onReadyRef.current = onReady;
-
-  function startDelayedPlayback() {
-    if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
-    delayTimerRef.current = setTimeout(() => {
-      playerRef.current?.playVideo();
-      onReadyRef.current?.();
-    }, delayMsRef.current);
-  }
-
+  // After delay, tell the sandbox to load the video
   useEffect(() => {
-    let destroyed = false;
-    initializedRef.current = false;
+    setStarted(false);
 
-    loadYouTubeAPI().then(() => {
-      if (destroyed || !containerRef.current) return;
-
-      // Clear any previous player
-      if (playerRef.current) {
-        playerRef.current.destroy();
-        playerRef.current = null;
+    timerRef.current = setTimeout(() => {
+      setStarted(true);
+      if (iframeRef.current?.contentWindow) {
+        iframeRef.current.contentWindow.postMessage(
+          { action: 'load', videoId },
+          '*',
+        );
       }
-
-      playerRef.current = new window.YT.Player(containerRef.current, {
-        videoId,
-        playerVars: {
-          autoplay: 0,
-          mute: 1, // Audio comes from TTS, not the video
-          controls: 1,
-          modestbranding: 1,
-          rel: 0,
-          playsinline: 1,
-        },
-        events: {
-          onReady: () => {
-            if (!destroyed) {
-              initializedRef.current = true;
-              startDelayedPlayback();
-            }
-          },
-        },
-      });
-    });
+      onReady?.();
+    }, delayMs);
 
     return () => {
-      destroyed = true;
-      if (delayTimerRef.current) clearTimeout(delayTimerRef.current);
-      if (playerRef.current) {
-        playerRef.current.destroy();
-        playerRef.current = null;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      // Clear the sandbox on unmount
+      if (iframeRef.current?.contentWindow) {
+        iframeRef.current.contentWindow.postMessage({ action: 'clear' }, '*');
       }
     };
-  }, [videoId]); // Recreate player when videoId changes
+  }, [videoId, delayMs]);
 
-  // If delayMs changes after initialization, restart the delay
-  useEffect(() => {
-    if (playerRef.current && initializedRef.current) {
-      playerRef.current.pauseVideo();
-      playerRef.current.seekTo(0, true);
-      startDelayedPlayback();
-    }
-  }, [delayMs]);
+  const sandboxUrl = chrome.runtime.getURL('youtube-sandbox.html');
 
   return (
-    <div style={{ width: '100%', aspectRatio: '16/9', background: '#000', borderRadius: 6, overflow: 'hidden' }}>
-      <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+    <div style={{ width: '100%', aspectRatio: '16/9', background: '#000', borderRadius: 6, overflow: 'hidden', position: 'relative' }}>
+      <iframe
+        ref={iframeRef}
+        src={sandboxUrl}
+        style={{ width: '100%', height: '100%', border: 'none' }}
+      />
+      {!started && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#94a3b8',
+            fontSize: 13,
+            background: '#000',
+          }}
+        >
+          Starting in {Math.ceil(delayMs / 1000)}s...
+        </div>
+      )}
     </div>
   );
 }

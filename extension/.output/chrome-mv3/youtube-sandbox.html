@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    iframe { width: 100%; height: 100%; border: none; }
+    .waiting {
+      width: 100%; height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      color: #94a3b8; font-family: system-ui, sans-serif; font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root" class="waiting">Waiting for video...</div>
+  <script>
+    window.addEventListener('message', (event) => {
+      const { action, videoId } = event.data || {};
+      if (action === 'load' && videoId) {
+        const params = new URLSearchParams({
+          autoplay: '1',
+          mute: '1',
+          controls: '1',
+          modestbranding: '1',
+          rel: '0',
+          playsinline: '1',
+        });
+        document.getElementById('root').innerHTML =
+          '<iframe src="https://www.youtube.com/embed/' + videoId + '?' + params.toString() +
+          '" allow="autoplay; encrypted-media" allowfullscreen></iframe>';
+      } else if (action === 'clear') {
+        document.getElementById('root').innerHTML = '<div class="waiting">Waiting for video...</div>';
+      }
+    });
+  </script>
+</body>
+</html>

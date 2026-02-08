@@ -15,7 +15,12 @@ export default defineConfig({
     },
     content_security_policy: {
       extension_pages:
-        "script-src 'self' https://www.youtube.com; frame-src https://www.youtube.com; object-src 'self'",
+        "script-src 'self'; frame-src 'self'; connect-src 'self' ws://localhost:8000 http://localhost:8000; object-src 'self'",
+      sandbox:
+        "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' https://www.youtube.com; frame-src https://www.youtube.com; child-src https://www.youtube.com",
+    },
+    sandbox: {
+      pages: ['youtube-sandbox.html'],
     },
   },
 });
