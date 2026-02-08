@@ -35,6 +35,8 @@ export function App() {
   const [streaming, setStreaming] = useState(false);
   const [commentary, setCommentary] = useState<CommentaryEntry[]>([]);
   const [paused, setPaused] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [transcript, setTranscript] = useState('');
 
   const capturePortRef = useRef<chrome.runtime.Port | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -43,6 +45,84 @@ export function App() {
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const frameCountRef = useRef(0);
   const pausedRef = useRef(false);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+
+  // ---- Voice input (ask the commentator) ----
+
+  function toggleListening() {
+    if (listening) {
+      recognitionRef.current?.stop();
+      return;
+    }
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setStatus('Speech recognition not supported in this browser.');
+      return;
+    }
+
+    // Pause current audio so the mic doesn't pick up TTS
+    if (currentAudioRef.current && !currentAudioRef.current.paused) {
+      currentAudioRef.current.pause();
+    }
+    playingAudioRef.current = false;
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognitionRef.current = recognition;
+
+    recognition.onstart = () => {
+      setListening(true);
+      setTranscript('');
+    };
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let final = '';
+      let interim = '';
+      for (let i = 0; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          final += event.results[i][0].transcript;
+        } else {
+          interim += event.results[i][0].transcript;
+        }
+      }
+      setTranscript(final || interim);
+    };
+
+    recognition.onend = () => {
+      setListening(false);
+      recognitionRef.current = null;
+
+      // Send final transcript to backend
+      setTranscript((prev) => {
+        if (prev.trim()) {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'user_question', text: prev.trim() }));
+          }
+          // Show user's question in the commentary feed
+          setCommentary((c) => [
+            { text: prev.trim(), emotion: 'neutral', analyst: 'You', timestamp: Date.now() },
+            ...c.slice(0, 29),
+          ]);
+        }
+        return '';
+      });
+    };
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      console.error('[AI Commentator] Speech recognition error:', event.error);
+      setListening(false);
+      recognitionRef.current = null;
+      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        setStatus(`Mic error: ${event.error}`);
+      }
+    };
+
+    recognition.start();
+  }
 
   // ---- Stream lifecycle ----
 
@@ -261,7 +341,7 @@ export function App() {
   };
 
   const analystColor: Record<string, string> = {
-    Danny: '#7c3aed', 'Coach Kay': '#0ea5e9', Rookie: '#f97316',
+    Danny: '#7c3aed', 'Coach Kay': '#0ea5e9', Rookie: '#f97316', You: '#10b981',
   };
 
   // ---- Profile setup ----
@@ -286,16 +366,32 @@ export function App() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <h1 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>AI Sports Commentator</h1>
           {streaming && (
-            <button
-              onClick={togglePause}
-              style={{
-                background: 'none', border: '1px solid #334155', borderRadius: 6,
-                color: paused ? '#facc15' : '#4ade80', fontSize: 11, fontWeight: 600,
-                padding: '3px 10px', cursor: 'pointer',
-              }}
-            >
-              {paused ? 'Resume' : 'Pause'}
-            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                onClick={toggleListening}
+                style={{
+                  background: listening ? '#ef4444' : 'none',
+                  border: `1px solid ${listening ? '#ef4444' : '#334155'}`,
+                  borderRadius: 6,
+                  color: listening ? 'white' : '#10b981',
+                  fontSize: 11, fontWeight: 600,
+                  padding: '3px 10px', cursor: 'pointer',
+                  animation: listening ? 'pulse 1.5s ease-in-out infinite' : 'none',
+                }}
+              >
+                {listening ? 'Listening...' : 'Ask'}
+              </button>
+              <button
+                onClick={togglePause}
+                style={{
+                  background: 'none', border: '1px solid #334155', borderRadius: 6,
+                  color: paused ? '#facc15' : '#4ade80', fontSize: 11, fontWeight: 600,
+                  padding: '3px 10px', cursor: 'pointer',
+                }}
+              >
+                {paused ? 'Resume' : 'Pause'}
+              </button>
+            </div>
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
@@ -370,6 +466,19 @@ export function App() {
           </button>
         </div>
 
+        {/* Live transcript while mic is active */}
+        {listening && transcript && (
+          <div style={{ padding: '4px 16px' }}>
+            <div style={{
+              padding: '8px 12px', borderRadius: 8,
+              background: '#064e3b', border: '1px solid #10b981',
+              fontSize: 12, color: '#6ee7b7', fontStyle: 'italic',
+            }}>
+              {transcript}
+            </div>
+          </div>
+        )}
+
         {/* Commentary feed */}
         {commentary.length > 0 && (
           <div style={{ padding: '0 16px 8px', display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -441,6 +550,7 @@ export function App() {
         ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #475569; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
       `}</style>
     </div>
   );

@@ -508,6 +508,13 @@ async def live_commentary_ws(ws: WebSocket):
                     pipeline.set_sport(sport)
                     await ws.send_json({"type": "status", "message": f"Sport set: {sport}"})
 
+                elif msg_type == "user_question":
+                    # Viewer asked a question via voice input
+                    question = data.get("text", "")
+                    if question:
+                        logger.info("Viewer question: %s", question)
+                        await pipeline.answer_question(question)
+
                 elif msg_type == "set_profile":
                     # Set a custom profile from JSON
                     profile = UserProfile.from_dict(data.get("profile", {}))

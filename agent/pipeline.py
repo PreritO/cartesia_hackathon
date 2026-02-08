@@ -833,6 +833,24 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
         else:
             await self._load_model()
 
+    async def answer_question(self, question: str) -> None:
+        """Answer a viewer's question using the current frame context.
+
+        Bypasses the debouncer so the answer is immediate.
+        """
+        if not self._running:
+            return
+
+        analyst_key = "danny"
+        sport_label = "American football game" if self._sport == "football" else "soccer match"
+        prompt = (
+            f"The viewer just asked you a question while watching a {sport_label}. "
+            f"Answer it naturally as part of your commentary — keep it brief (1-2 sentences). "
+            f"Use the current frame for context if relevant.\n\n"
+            f"Viewer's question: \"{question}\""
+        )
+        await self._commentate(prompt, analyst_key=analyst_key, frame_ts=self._last_frame_ts)
+
     async def process_frame(self, jpeg_bytes: bytes) -> None:
         """Process a JPEG frame: either via RF-DETR or straight to Claude.
 
