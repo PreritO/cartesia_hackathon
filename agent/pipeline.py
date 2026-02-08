@@ -131,8 +131,12 @@ class BaseCommentaryPipeline:
     def set_profile(self, profile: UserProfile) -> None:
         """Update the user profile (can be called mid-session)."""
         self._profile = profile
-        logger.info("Profile set: %s (expertise=%d, hot_take=%d)",
-                     profile.name, profile.expertise_slider, profile.hot_take_slider)
+        logger.info(
+            "Profile set: %s (expertise=%d, hot_take=%d)",
+            profile.name,
+            profile.expertise_slider,
+            profile.hot_take_slider,
+        )
 
     def _build_system_prompt(self) -> str:
         """Build the full system prompt = base instructions + personalization."""
@@ -469,12 +473,18 @@ class BaseCommentaryPipeline:
 
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
-            max_tokens=200,
+            max_tokens=120,
             system=self._build_system_prompt(),
             messages=[{"role": "user", "content": content}],
         )
         if response.content and response.content[0].type == "text":
-            return response.content[0].text
+            text = response.content[0].text.strip()
+            # If LLM says SKIP, nothing worth commenting on
+            if text.upper() == "SKIP" or (
+                text.upper().startswith("[EMOTION") and "SKIP" in text.upper()
+            ):
+                return ""
+            return text
         return ""
 
     def _get_voice_id(self) -> str:
