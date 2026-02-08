@@ -506,9 +506,7 @@ async def live_commentary_ws(ws: WebSocket):
                     # Switch sport mid-session
                     sport = data.get("sport", "soccer")
                     pipeline.set_sport(sport)
-                    await ws.send_json(
-                        {"type": "status", "message": f"Sport set: {sport}"}
-                    )
+                    await ws.send_json({"type": "status", "message": f"Sport set: {sport}"})
 
                 elif msg_type == "set_profile":
                     # Set a custom profile from JSON

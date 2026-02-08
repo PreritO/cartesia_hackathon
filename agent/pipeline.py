@@ -254,12 +254,8 @@ class BaseCommentaryPipeline:
             return
         self._sport = sport
         self._analysts = _build_analysts(sport)
-        self._commentary_prompts = COMMENTARY_PROMPTS_BY_SPORT.get(
-            sport, COMMENTARY_PROMPTS_SOCCER
-        )
-        self._instructions = _INSTRUCTIONS_BY_SPORT.get(
-            sport, _INSTRUCTIONS_BY_SPORT["soccer"]
-        )
+        self._commentary_prompts = COMMENTARY_PROMPTS_BY_SPORT.get(sport, COMMENTARY_PROMPTS_SOCCER)
+        self._instructions = _INSTRUCTIONS_BY_SPORT.get(sport, _INSTRUCTIONS_BY_SPORT["soccer"])
         logger.info("Sport switched to: %s", sport)
 
     def _pick_analyst(self, scene: str) -> str:

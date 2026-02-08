@@ -38,7 +38,9 @@ class UserProfile:
             if self.expertise_slider < 20:
                 return "Complete beginner — explain everything simply, define terms like downs, first down, touchdown, field goal, etc."
             elif self.expertise_slider < 50:
-                return "Casual fan — knows the basics, explain formations, play types, and penalties"
+                return (
+                    "Casual fan — knows the basics, explain formations, play types, and penalties"
+                )
             elif self.expertise_slider < 80:
                 return "Knowledgeable — appreciates X's and O's, coverage schemes, route concepts"
             else:
