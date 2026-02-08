@@ -63,6 +63,7 @@ export function App() {
   const [showDebug, setShowDebug] = useState(false);
   const [delayedFrameSrc, setDelayedFrameSrc] = useState<string | null>(null);
   const [lockedDelayDisplay, setLockedDelayDisplay] = useState(0);
+  const [paused, setPaused] = useState(false);
 
   const capturePortRef = useRef<chrome.runtime.Port | null>(null);
   const captureTabIdRef = useRef<number | null>(null);
@@ -79,6 +80,11 @@ export function App() {
   const calibratedRef = useRef(false);
   const lockedDelayRef = useRef(0);
   const calibrationSamplesRef = useRef<number[]>([]);
+
+  // ---- Pause state ----
+  const pausedRef = useRef(false);
+  const pauseStartRef = useRef(0);
+  const pendingCommentaryRef = useRef<{ text: string; emotion: string; analyst: string; audio: string | null; frameTs: number }[]>([]);
 
   // ---- Calibration: collects samples, locks delay on the Nth commentary ----
 
@@ -122,6 +128,11 @@ export function App() {
     console.log('[AI Commentator] %s commentary scheduled: waitMs=%dms', analyst, waitMs);
 
     const timerId = setTimeout(() => {
+      // If paused when timeout fires, buffer for resume
+      if (pausedRef.current) {
+        pendingCommentaryRef.current.push({ text, emotion, analyst, audio, frameTs });
+        return;
+      }
       setCommentary((prev) => [
         { text, emotion, analyst, capturedAt: frameTs, displayedAt: Date.now() },
         ...prev.slice(0, 19),
@@ -379,6 +390,7 @@ export function App() {
   // ---- Audio playback (queue with graceful handoff) ----
 
   function playNextAudio() {
+    if (pausedRef.current) return;
     if (playingAudioRef.current) {
       if (audioQueueRef.current.length > 2 && currentAudioRef.current) {
         while (audioQueueRef.current.length > 1) {
@@ -419,6 +431,63 @@ export function App() {
     });
   }
 
+  // ---- Play / Pause ----
+
+  function pauseStream() {
+    pausedRef.current = true;
+    pauseStartRef.current = Date.now();
+    setPaused(true);
+
+    // Freeze the delayed playback loop
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+
+    // Pause current audio
+    if (currentAudioRef.current && !currentAudioRef.current.paused) {
+      currentAudioRef.current.pause();
+    }
+
+    // Tell content script to pause YouTube video + stop capturing
+    try {
+      capturePortRef.current?.postMessage({ type: 'PAUSE_CAPTURE' });
+    } catch { /* port may be closed */ }
+
+    setStatus('Paused');
+  }
+
+  function resumeStream() {
+    // Shift the delay forward by how long we were paused
+    const pauseDuration = Date.now() - pauseStartRef.current;
+    lockedDelayRef.current += pauseDuration;
+    setLockedDelayDisplay(lockedDelayRef.current);
+
+    pausedRef.current = false;
+    setPaused(false);
+
+    // Restart the delayed playback rAF loop
+    startDelayedPlayback();
+
+    // Resume audio if it was playing
+    if (currentAudioRef.current?.paused) {
+      currentAudioRef.current.play().catch(() => {});
+    }
+
+    // Flush any commentary that arrived during the pause
+    const pending = pendingCommentaryRef.current.splice(0);
+    for (const pc of pending) {
+      scheduleCommentary(pc.text, pc.emotion, pc.analyst, pc.audio, pc.frameTs);
+    }
+
+    // Tell content script to resume YouTube video + restart capture
+    try {
+      capturePortRef.current?.postMessage({ type: 'RESUME_CAPTURE' });
+    } catch { /* port may be closed */ }
+
+    setStatus('Live — synced!');
+  }
+
   // ---- Stop everything ----
 
   function stopStream() {
@@ -451,6 +520,9 @@ export function App() {
     }
     audioQueueRef.current = [];
     playingAudioRef.current = false;
+    pausedRef.current = false;
+    pendingCommentaryRef.current = [];
+    setPaused(false);
     setStreaming(false);
   }
 
@@ -536,17 +608,60 @@ export function App() {
               background: '#000',
               borderRadius: 6,
               overflow: 'hidden',
+              position: 'relative',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
             }}
           >
             {streaming && calibrated && delayedFrameSrc ? (
-              <img
-                src={delayedFrameSrc}
-                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                alt="Synced playback"
-              />
+              <>
+                <img
+                  src={delayedFrameSrc}
+                  style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                  alt="Synced playback"
+                />
+                {/* Play/Pause overlay button */}
+                <button
+                  onClick={paused ? resumeStream : pauseStream}
+                  style={{
+                    position: 'absolute',
+                    bottom: 8, left: 8,
+                    width: 36, height: 36,
+                    borderRadius: '50%',
+                    border: 'none',
+                    background: 'rgba(0, 0, 0, 0.6)',
+                    color: 'white',
+                    fontSize: 16,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    backdropFilter: 'blur(4px)',
+                    transition: 'background 0.15s',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(124, 58, 237, 0.8)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0, 0, 0, 0.6)'; }}
+                  title={paused ? 'Resume' : 'Pause'}
+                >
+                  {paused ? '\u25B6' : '\u23F8'}
+                </button>
+                {/* Paused indicator */}
+                {paused && (
+                  <div style={{
+                    position: 'absolute',
+                    top: 8, right: 8,
+                    background: 'rgba(0, 0, 0, 0.7)',
+                    borderRadius: 4,
+                    padding: '3px 8px',
+                    fontSize: 11,
+                    color: '#facc15',
+                    fontWeight: 600,
+                  }}>
+                    PAUSED
+                  </div>
+                )}
+              </>
             ) : (
               <div style={{ textAlign: 'center' }}>
                 <span style={{ color: '#475569', fontSize: 13 }}>

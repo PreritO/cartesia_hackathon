@@ -7,8 +7,8 @@
  * 3. Overlays the YouTube video player with a "Watch in sidebar" banner.
  * 4. Mutes the video (audio comes from TTS in the sidebar).
  *
- * This decouples frame capture from display: the sidebar shows a delayed,
- * synced version while the tab's video is hidden under an overlay.
+ * Supports PAUSE_CAPTURE / RESUME_CAPTURE to freeze/resume the YouTube
+ * video and frame capture in sync with the sidebar's play/pause controls.
  */
 
 const CAPTURE_FPS = 5;
@@ -16,12 +16,17 @@ const JPEG_QUALITY = 0.7;
 const MAX_WIDTH = 1280;
 
 let captureInterval: ReturnType<typeof setInterval> | null = null;
+let capturePort: chrome.runtime.Port | null = null;
+let captureCanvas: HTMLCanvasElement | null = null;
+let captureCtx: CanvasRenderingContext2D | null = null;
 let overlayEl: HTMLDivElement | null = null;
 let wasMuted = false;
 
 function findVideo(): HTMLVideoElement | null {
   return document.querySelector('video');
 }
+
+// ---- Capture lifecycle ----
 
 function startCapture(port: chrome.runtime.Port) {
   const video = findVideo();
@@ -30,16 +35,29 @@ function startCapture(port: chrome.runtime.Port) {
     return;
   }
 
+  capturePort = port;
+
   // Remember mute state and mute (audio comes from TTS)
   wasMuted = video.muted;
   video.muted = true;
 
   // Create offscreen canvas
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d')!;
+  captureCanvas = document.createElement('canvas');
+  captureCtx = captureCanvas.getContext('2d')!;
 
-  // Show overlay
   showOverlay();
+  startCaptureLoop();
+  port.postMessage({ type: 'CAPTURE_ACTIVE' });
+}
+
+function startCaptureLoop() {
+  stopCaptureLoop();
+  const video = findVideo();
+  if (!video || !captureCtx || !captureCanvas || !capturePort) return;
+
+  const canvas = captureCanvas;
+  const ctx = captureCtx;
+  const port = capturePort;
 
   captureInterval = setInterval(() => {
     if (!video || video.readyState < video.HAVE_CURRENT_DATA) return;
@@ -64,19 +82,35 @@ function startCapture(port: chrome.runtime.Port) {
     const base64 = dataUrl.split(',')[1];
     port.postMessage({ type: 'FRAME', data: base64, ts: Date.now() });
   }, 1000 / CAPTURE_FPS);
-
-  port.postMessage({ type: 'CAPTURE_ACTIVE' });
 }
 
-function stopCapture() {
+function stopCaptureLoop() {
   if (captureInterval) {
     clearInterval(captureInterval);
     captureInterval = null;
   }
+}
+
+function stopCapture() {
+  stopCaptureLoop();
+  capturePort = null;
+  captureCanvas = null;
+  captureCtx = null;
   hideOverlay();
-  // Restore mute state
   const video = findVideo();
   if (video) video.muted = wasMuted;
+}
+
+function pauseCapture() {
+  stopCaptureLoop();
+  const video = findVideo();
+  if (video) video.pause();
+}
+
+function resumeCapture() {
+  const video = findVideo();
+  if (video) video.play();
+  startCaptureLoop();
 }
 
 // ---- Overlay on YouTube player ----
@@ -86,11 +120,9 @@ function showOverlay() {
   const video = findVideo();
   if (!video) return;
 
-  // YouTube wraps the video in .html5-video-player
   const player = video.closest('.html5-video-player') || video.parentElement;
   if (!player || !(player instanceof HTMLElement)) return;
 
-  // Ensure parent is positioned so absolute overlay works
   const pos = getComputedStyle(player).position;
   if (pos === 'static') player.style.position = 'relative';
 
@@ -133,14 +165,25 @@ export default defineContentScript({
   main() {
     console.log('[AI Commentator] Content script loaded on YouTube page');
 
-    // Port-based communication for frame capture
     chrome.runtime.onConnect.addListener((port) => {
       if (port.name !== 'capture') return;
       console.log('[AI Commentator] Capture port connected');
 
       port.onMessage.addListener((msg) => {
-        if (msg.type === 'START_CAPTURE') startCapture(port);
-        if (msg.type === 'STOP_CAPTURE') stopCapture();
+        switch (msg.type) {
+          case 'START_CAPTURE':
+            startCapture(port);
+            break;
+          case 'STOP_CAPTURE':
+            stopCapture();
+            break;
+          case 'PAUSE_CAPTURE':
+            pauseCapture();
+            break;
+          case 'RESUME_CAPTURE':
+            resumeCapture();
+            break;
+        }
       });
 
       port.onDisconnect.addListener(() => {
