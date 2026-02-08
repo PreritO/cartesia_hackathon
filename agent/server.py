@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from agent.config import config
 from agent.pipeline import CommentaryPipeline, LiveCommentaryPipeline, get_or_load_model
+from agent.user_profile import PERSONAS, UserProfile
 from agent.video_download import VideoInfo, download_video
 
 logger = logging.getLogger(__name__)
@@ -134,9 +135,30 @@ async def live_commentary_ws(ws: WebSocket):
                 import json
 
                 data = json.loads(message["text"])
-                if data.get("type") == "stop":
+                msg_type = data.get("type")
+
+                if msg_type == "stop":
                     logger.info("Client requested stop for live session %s", session_id)
                     break
+
+                elif msg_type == "set_persona":
+                    # Select a pre-defined persona by key
+                    persona_key = data.get("persona", "")
+                    if persona_key in PERSONAS:
+                        pipeline.set_profile(PERSONAS[persona_key])
+                        await ws.send_json(
+                            {"type": "status", "message": f"Persona: {PERSONAS[persona_key].name}"}
+                        )
+                    else:
+                        logger.warning("Unknown persona: %s", persona_key)
+
+                elif msg_type == "set_profile":
+                    # Set a custom profile from JSON
+                    profile = UserProfile.from_dict(data.get("profile", {}))
+                    pipeline.set_profile(profile)
+                    await ws.send_json(
+                        {"type": "status", "message": f"Profile set: {profile.name}"}
+                    )
 
     except WebSocketDisconnect:
         logger.info("Live WebSocket disconnected: session %s", session_id)

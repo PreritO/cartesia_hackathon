@@ -29,6 +29,14 @@ interface BufferedFrame {
   timestamp: number;
 }
 
+const PERSONA_OPTIONS = [
+  { key: '', label: 'Default (General Audience)' },
+  { key: 'casual_fan', label: 'Casual Fan — Alex' },
+  { key: 'new_to_soccer', label: 'New to Soccer — Jordan' },
+  { key: 'tactical_nerd', label: 'Tactical Nerd — Sam' },
+  { key: 'passionate_homer', label: 'Passionate Homer — Danny' },
+] as const;
+
 export function App() {
   const [status, setStatus] = useState('Click "Start Stream" and pick your YouTube tab.');
   const [streaming, setStreaming] = useState(false);
@@ -37,6 +45,7 @@ export function App() {
   const [showDebug, setShowDebug] = useState(false);
   const [delayMs, setDelayMs] = useState(PIPELINE_DELAY_MS);
   const [delayedFrameSrc, setDelayedFrameSrc] = useState<string | null>(null);
+  const [persona, setPersona] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -145,6 +154,10 @@ export function App() {
     ws.onopen = () => {
       console.log('[AI Commentator] WebSocket connected');
       setStatus('Connected! Buffering delayed video...');
+      // Send persona selection before frames start flowing
+      if (persona) {
+        ws.send(JSON.stringify({ type: 'set_persona', persona }));
+      }
       startFrameCapture();
       startDelayedPlayback();
     };
@@ -471,6 +484,41 @@ export function App() {
             )}
           </div>
         )}
+
+        {/* Persona selector */}
+        <div style={{ padding: '4px 16px 8px' }}>
+          <label style={{ fontSize: 11, color: '#64748b', display: 'block', marginBottom: 4 }}>
+            Viewer Persona
+          </label>
+          <select
+            value={persona}
+            onChange={(e) => {
+              const key = e.target.value;
+              setPersona(key);
+              // Send to backend if already connected
+              const ws = wsRef.current;
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                if (key) {
+                  ws.send(JSON.stringify({ type: 'set_persona', persona: key }));
+                } else {
+                  ws.send(JSON.stringify({ type: 'set_profile', profile: {} }));
+                }
+              }
+            }}
+            style={{
+              width: '100%',
+              padding: '8px 10px', borderRadius: 6,
+              border: '1px solid #334155',
+              background: '#1e293b', color: '#e2e8f0',
+              fontSize: 13, cursor: 'pointer',
+              appearance: 'auto',
+            }}
+          >
+            {PERSONA_OPTIONS.map((opt) => (
+              <option key={opt.key} value={opt.key}>{opt.label}</option>
+            ))}
+          </select>
+        </div>
 
         {/* Controls */}
         <div style={{ padding: '4px 16px 8px' }}>

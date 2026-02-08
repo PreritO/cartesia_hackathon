@@ -31,6 +31,7 @@ from vision_agents.core.utils.video_track import VideoFileTrack
 
 from agent.config import config
 from agent.processors.events import DetectedObject
+from agent.user_profile import UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +80,12 @@ class BaseCommentaryPipeline:
         ws: WebSocket connection to stream results to the frontend.
     """
 
-    def __init__(self, ws: WebSocket) -> None:
+    def __init__(self, ws: WebSocket, profile: UserProfile | None = None) -> None:
         self.ws = ws
         self._running = False
+
+        # User profile for personalized commentary
+        self._profile: UserProfile = profile or UserProfile()
 
         # RF-DETR model (loaded via _load_model)
         self._model: Any = None
@@ -120,6 +124,20 @@ class BaseCommentaryPipeline:
 
         # Recent commentary history (passed to Claude to avoid repetition)
         self._recent_commentary: list[str] = []
+
+    def set_profile(self, profile: UserProfile) -> None:
+        """Update the user profile (can be called mid-session)."""
+        self._profile = profile
+        logger.info("Profile set: %s (expertise=%d, hot_take=%d)",
+                     profile.name, profile.expertise_slider, profile.hot_take_slider)
+
+    def _build_system_prompt(self) -> str:
+        """Build the full system prompt = base instructions + personalization."""
+        prompt = INSTRUCTIONS
+        profile_block = self._profile.build_prompt_block()
+        if profile_block:
+            prompt += "\n" + profile_block
+        return prompt
 
     # ---- Model loading ----
 
@@ -448,7 +466,7 @@ class BaseCommentaryPipeline:
         response = await self._anthropic.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=200,
-            system=INSTRUCTIONS,
+            system=self._build_system_prompt(),
             messages=[{"role": "user", "content": content}],
         )
         if response.content and response.content[0].type == "text":
@@ -572,10 +590,11 @@ class LiveCommentaryPipeline(BaseCommentaryPipeline):
 
     Args:
         ws: WebSocket connection to stream results to the frontend.
+        profile: Optional user profile for personalized commentary.
     """
 
-    def __init__(self, ws: WebSocket) -> None:
-        super().__init__(ws)
+    def __init__(self, ws: WebSocket, profile: UserProfile | None = None) -> None:
+        super().__init__(ws, profile=profile)
 
     async def initialize(self) -> None:
         """Load the RF-DETR model and notify the client."""
